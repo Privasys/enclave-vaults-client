@@ -1,0 +1,17 @@
+# Go
+go/go.sum
+go/*.exe
+
+# Rust
+rust/target/
+rust/Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
