@@ -150,7 +150,6 @@ cargo test
 | [enclave-os-mini](https://github.com/Privasys/enclave-os-mini) | SGX enclave runtime (Rust) |
 | [enclave-os-virtual](https://github.com/Privasys/enclave-os-virtual) | TDX/SEV-SNP confidential VM runtime (Go) |
 | [ra-tls-clients](https://github.com/Privasys/ra-tls-clients) | RA-TLS client libraries |
-| [ra-tls-caddy](https://github.com/Privasys/ra-tls-caddy) | RA-TLS Caddy module |
 
 ## License
 
