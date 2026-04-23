@@ -3,9 +3,9 @@
 
 [package]
 name = "vault-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Vault client with Shamir Secret Sharing for enclave-os-mini"
+description = "Constellation-aware vault client (HSM-shaped) for enclave-os-mini"
 license = "AGPL-3.0-only"
 repository = "https://github.com/Privasys/enclave-vaults-client"
 
@@ -14,8 +14,9 @@ name = "vault_client"
 path = "src/lib.rs"
 
 [dependencies]
-ratls-client = { git = "https://github.com/Privasys/ra-tls-clients.git", tag = "v0.2.0" }
+ratls-client = { git = "https://github.com/Privasys/ra-tls-clients.git", tag = "v0.3.0" }
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }

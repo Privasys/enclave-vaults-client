@@ -1,662 +1,1106 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! High-level vault client with Shamir Secret Sharing.
+//! Enclave Vaults Rust client (constellation-aware, HSM-shaped wire protocol).
 //!
-//! Distributes secret shares across multiple vault instances (SGX enclaves)
-//! via RA-TLS connections, and reconstructs secrets from any `threshold`
-//! shares.
+//! Compatible with `enclave-os-mini >= 0.19` and the Privasys
+//! `enclave-vaults` composition crate.  Replaces the legacy
+//! `StoreSecret`/`GetSecret`/`DeleteSecret`/`UpdateSecretPolicy` API.
 //!
-//! # Architecture
+//! Three layers:
 //!
-//! ```text
-//!  ┌──────────────┐       RA-TLS         ┌─────────────┐
-//!  │              │──── share 1 ────────►│  Vault #1   │
-//!  │  VaultClient │──── share 2 ────────►│  Vault #2   │
-//!  │  (Shamir)    │──── share 3 ────────►│  Vault #3   │
-//!  │              │       ...            │    ...      │
-//!  │              │──── share M ────────►│  Vault #M   │
-//!  └──────────────┘                      └─────────────┘
+//!  1. [`RegistryClient`] — query the Attested Registry phonebook for live
+//!     vault instances.
+//!  2. [`Client`] — single-vault RA-TLS session that issues HSM-shaped
+//!     requests (`CreateKey`, `Wrap`, `Sign`, etc.).
+//!  3. [`Constellation`] — fan-out helpers for cross-vault operations
+//!     (chiefly `StagePendingProfile` / `PromotePendingProfile` during an
+//!     enclave upgrade).
 //!
-//!  Reconstruction: any N-of-M shares → original secret
-//! ```
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! use vault_client::client::{VaultClient, VaultClientConfig, VaultEndpoint};
-//!
-//! let config = VaultClientConfig {
-//!     endpoints: vec![
-//!         VaultEndpoint { host: "vault1.example.com".into(), port: 443 },
-//!         VaultEndpoint { host: "vault2.example.com".into(), port: 443 },
-//!         VaultEndpoint { host: "vault3.example.com".into(), port: 443 },
-//!     ],
-//!     threshold: 2,
-//!     signing_key_pkcs8: std::fs::read("owner-key.p8").unwrap(),
-//!     ca_cert_pem: Some("vault-ca.pem".into()),
-//!     vault_policy: None,
-//! };
-//!
-//! let client = VaultClient::new(config).unwrap();
-//!
-//! // Store — Shamir splits the secret into 3 shares (threshold 2)
-//! let results = client.store_secret("my-dek", secret_bytes, &policy).unwrap();
-//!
-//! // Retrieve — fetches 2 shares and reconstructs
-//! let secret = client.get_secret("my-dek", None, &my_quote, &[]).unwrap();
-//! ```
+//! Shamir Secret Sharing helpers ([`crate::shamir`]) are unchanged and
+//! used to split a secret into `RawShare` material before [`Client::create_key`].
+
+use std::sync::Mutex;
+use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use serde::{Deserialize, Serialize};
 
-use crate::shamir;
-use ratls_client::RaTlsClient;
-use ratls_client::VerificationPolicy;
+use ratls_client::{RaTlsClient, VerificationPolicy};
 
-// ---------------------------------------------------------------------------
-//  Configuration
-// ---------------------------------------------------------------------------
+// ===========================================================================
+//  Errors
+// ===========================================================================
 
-/// A single vault endpoint address.
-#[derive(Debug, Clone)]
-pub struct VaultEndpoint {
-    pub host: String,
-    pub port: u16,
+/// All errors returned by this crate.
+#[derive(Debug)]
+pub enum Error {
+    /// HTTP / I/O error talking to the registry.
+    Registry(String),
+    /// Connection or RA-TLS verification error talking to a vault.
+    Transport(String),
+    /// JSON encoding/decoding error.
+    Codec(String),
+    /// The vault returned `VaultResponse::Error(msg)`.
+    Vault(String),
+    /// The vault returned a response variant unrelated to the request.
+    UnexpectedResponse,
+    /// Configuration error (bad arguments, missing fields, ...).
+    Config(String),
 }
 
-impl std::fmt::Display for VaultEndpoint {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.host, self.port)
+        match self {
+            Error::Registry(s) => write!(f, "registry: {s}"),
+            Error::Transport(s) => write!(f, "transport: {s}"),
+            Error::Codec(s) => write!(f, "codec: {s}"),
+            Error::Vault(s) => write!(f, "vault error: {s}"),
+            Error::UnexpectedResponse => write!(f, "vault returned unexpected response variant"),
+            Error::Config(s) => write!(f, "config: {s}"),
+        }
     }
 }
 
-/// Configuration for the vault client.
-pub struct VaultClientConfig {
-    /// Vault endpoint addresses (one share per endpoint).
-    pub endpoints: Vec<VaultEndpoint>,
-    /// Shamir threshold: minimum shares needed to reconstruct.
-    /// Must be `>= 2` and `<= endpoints.len()`.
-    pub threshold: usize,
-    /// PKCS#8 DER-encoded ES256 (P-256) private key for JWT signing.
-    /// This is the secret owner's key, used to authenticate
-    /// store/delete/update operations.
-    pub signing_key_pkcs8: Vec<u8>,
-    /// Optional PEM CA certificate path for TLS chain verification.
-    /// If `None`, certificate verification is disabled (dev mode).
-    pub ca_cert_pem: Option<String>,
-    /// Optional RA-TLS verification policy for the vault's certificate.
-    /// Use this to verify the vault's MRENCLAVE/MRSIGNER before sending shares.
-    pub vault_policy: Option<VerificationPolicy>,
-    /// Optional client certificate for mutual RA-TLS (used by `get_secret`).
-    ///
-    /// This is the querying enclave's RA-TLS certificate chain (DER, leaf
-    /// first) containing the SGX/TDX quote in X.509 extensions. When set,
-    /// `get_secret` presents this certificate during the TLS handshake so
-    /// the vault can verify the caller's attestation.
-    pub client_cert_der: Option<Vec<Vec<u8>>>,
-    /// PKCS#8-encoded private key for `client_cert_der`.
-    pub client_key_pkcs8: Option<Vec<u8>>,
-}
+impl std::error::Error for Error {}
 
-// ---------------------------------------------------------------------------
-//  Result types
-// ---------------------------------------------------------------------------
+pub type Result<T> = std::result::Result<T, Error>;
 
-/// Result of an operation against a single vault endpoint.
-#[derive(Debug, Clone)]
-pub struct EndpointResult {
-    /// Endpoint address (host:port).
+// ===========================================================================
+//  Registry client
+// ===========================================================================
+
+/// One vault registration as published by the Attested Registry.
+///
+/// Mirrors the JSON shape from `platform/enclave-vaults/registry/main.go`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultRegistration {
+    pub id: String,
     pub endpoint: String,
-    /// Whether the operation succeeded.
-    pub success: bool,
-    /// Error message (if failed).
-    pub error: Option<String>,
-    /// Expiry timestamp (for store operations).
-    pub expires_at: Option<u64>,
+    pub mrenclave: String,
+    #[serde(default)]
+    pub mrsigner: String,
+    #[serde(rename = "registeredAt")]
+    pub registered_at: String,
+    #[serde(rename = "lastHeartbeat")]
+    pub last_heartbeat: String,
+    pub status: String,
 }
 
-/// Successfully reconstructed secret.
-#[derive(Debug, Clone)]
-pub struct ReconstructedSecret {
-    /// The original secret bytes.
-    pub secret: Vec<u8>,
-    /// Earliest expiry across the shares that were used.
-    pub expires_at: u64,
+impl VaultRegistration {
+    /// Host portion of `endpoint` (everything before the last colon).
+    pub fn host(&self) -> &str {
+        match self.endpoint.rfind(':') {
+            Some(i) => &self.endpoint[..i],
+            None => &self.endpoint,
+        }
+    }
+
+    /// Port portion of `endpoint`. Defaults to 8443 if missing or invalid.
+    pub fn port(&self) -> u16 {
+        self.endpoint
+            .rfind(':')
+            .and_then(|i| self.endpoint[i + 1..].parse().ok())
+            .unwrap_or(8443)
+    }
 }
 
-// ---------------------------------------------------------------------------
-//  Wire types (mirrors of enclave-os-vault/src/types.rs)
-// ---------------------------------------------------------------------------
+/// Thin client for the Attested Registry phonebook.
+pub struct RegistryClient {
+    base_url: String,
+    agent: ureq::Agent,
+}
 
-/// Vault-specific request, JSON-encoded inside `Request::Data`.
+impl RegistryClient {
+    /// Construct a `RegistryClient` with a 10 s HTTP timeout.
+    pub fn new(base_url: impl Into<String>) -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(10))
+            .build();
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            agent,
+        }
+    }
+
+    /// Fetch the current set of live vault registrations.
+    pub fn list_vaults(&self) -> Result<Vec<VaultRegistration>> {
+        #[derive(Deserialize)]
+        struct Payload {
+            vaults: Vec<VaultRegistration>,
+            #[allow(dead_code)]
+            #[serde(default)]
+            count: u32,
+        }
+
+        let url = format!("{}/api/vaults", self.base_url);
+        let resp = self
+            .agent
+            .get(&url)
+            .call()
+            .map_err(|e| Error::Registry(e.to_string()))?;
+        let body: Payload = resp
+            .into_json()
+            .map_err(|e| Error::Registry(format!("decode: {e}")))?;
+        Ok(body.vaults)
+    }
+}
+
+// ===========================================================================
+//  Wire types — VaultRequest / VaultResponse
+//
+//  Mirror enclave-os-mini/crates/enclave-os-vault/src/types.rs.
+// ===========================================================================
+
+/// Cryptographic type of a stored key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyType {
+    RawShare,
+    Aes256GcmKey,
+    P256SigningKey,
+    HmacSha256Key,
+}
+
+/// Per-key operation grantable by an [`OperationRule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Operation {
+    ExportKey,
+    DeleteKey,
+    UpdatePolicy,
+    Wrap,
+    Unwrap,
+    Sign,
+    Mac,
+    PromoteProfile,
+}
+
+/// Top-level policy field whose mutability can be granted / forbidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyField {
+    Owner,
+    Managers,
+    Auditors,
+    Tees,
+    Operations,
+    Lifecycle,
+    Mutability,
+    PendingProfiles,
+}
+
+/// Origin of a pending attestation profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PendingProfileSource {
+    PlatformBuild,
+    ManualImport,
+}
+
+/// Outcome recorded in the audit log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuditDecision {
+    Allowed,
+    Denied,
+}
+
+// ----------------------------------------------------------------------
+//  Principals & attestation
+// ----------------------------------------------------------------------
+
+/// One acceptable enclave / VM measurement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum VaultRequest {
-    StoreSecret { jwt: Vec<u8> },
-    GetSecret {
-        name: String,
-        #[serde(default)]
-        bearer_token: Option<Vec<u8>>,
-    },
-    DeleteSecret { jwt: Vec<u8> },
-    UpdateSecretPolicy { jwt: Vec<u8> },
+pub enum Measurement {
+    Mrenclave(String),
+    Mrtd(String),
 }
 
-/// Vault-specific response, JSON-encoded inside `Response::Data`.
+/// Pinned attestation verifier endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum VaultResponse {
-    SecretStored { name: String, expires_at: u64 },
-    SecretValue { secret: Vec<u8>, expires_at: u64 },
-    SecretDeleted,
-    PolicyUpdated,
-    Error(String),
+pub struct AttestationServer {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pinned_spki_sha256_hex: String,
 }
 
-/// OID claim from the caller's RA-TLS certificate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OidClaim {
-    pub oid: String,
-    pub value: String,
-}
-
-/// OID requirement in a secret policy.
+/// Required X.509 OID extension on a peer cert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidRequirement {
     pub oid: String,
     pub value: String,
 }
 
-/// Access policy for a vault secret.
+/// Attestation profile constraining what a remote TEE quote must satisfy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecretPolicy {
-    #[serde(default)]
-    pub allowed_mrenclave: Vec<String>,
-    #[serde(default)]
-    pub allowed_mrtd: Vec<String>,
-    /// Hex-encoded uncompressed P-256 public key (65 bytes: `04 || x || y`)
-    /// of the manager authorised to issue bearer tokens for this secret.
-    /// If present, `GetSecret` requires a valid JWT signed by this key.
-    #[serde(default)]
-    pub manager_pubkey: Option<String>,
-    #[serde(default)]
+pub struct AttestationProfile {
+    pub name: String,
+    pub measurements: Vec<Measurement>,
+    pub attestation_servers: Vec<AttestationServer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_oids: Vec<OidRequirement>,
-    #[serde(default)]
+}
+
+/// OIDC bearer-token authentication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcPrincipal {
+    pub issuer: String,
+    pub sub: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_roles: Vec<String>,
+}
+
+/// FIDO2 authentication (reserved — not yet honoured).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fido2Principal {
+    pub rp_id: String,
+    pub credential_id_b64: String,
+}
+
+/// An identity that can act on a key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Principal {
+    Oidc(OidcPrincipal),
+    Fido2(Fido2Principal),
+    Tee(AttestationProfile),
+}
+
+/// Named identities of a key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrincipalSet {
+    pub owner: Option<Principal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managers: Vec<Principal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auditors: Vec<Principal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tees: Vec<Principal>,
+}
+
+/// Reference into a [`PrincipalSet`].
+///
+/// Wire shape (serde externally-tagged enum):
+///
+/// - `"Owner"` / `"AnyTee"` (unit variants encoded as bare strings).
+/// - `{"Manager": <u32>}` / `{"Auditor": <u32>}` / `{"Tee": <u32>}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrincipalRef {
+    Owner,
+    AnyTee,
+    Manager(u32),
+    Auditor(u32),
+    Tee(u32),
+}
+
+/// Extra access-time predicate attached to an [`OperationRule`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Condition {
+    AttestationMatches(AttestationProfile),
+    ManagerApproval {
+        manager: u32,
+        fresh_for_seconds: u64,
+    },
+    TimeWindow {
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        not_before: u64,
+        #[serde(default, skip_serializing_if = "is_zero_u64")]
+        not_after: u64,
+    },
+}
+
+fn is_zero_u64(x: &u64) -> bool {
+    *x == 0
+}
+
+/// Grants a set of operations to a set of principals, optionally gated by
+/// extra conditions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationRule {
+    pub ops: Vec<Operation>,
+    pub principals: Vec<PrincipalRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<Condition>,
+}
+
+/// Controls who can change which fields on `UpdatePolicy`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Mutability {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_can: Vec<PolicyField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manager_can: Vec<PolicyField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub immutable: Vec<PolicyField>,
+}
+
+/// Defines the key TTL.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Lifecycle {
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub ttl_seconds: u64,
 }
 
-// JWT claim types (must match vault expectations)
-
-#[derive(Serialize)]
-struct StoreSecretClaims<'a> {
-    name: &'a str,
-    secret: String, // base64url-encoded
-    policy: &'a SecretPolicy,
+/// The full per-key access policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyPolicy {
+    pub version: u32,
+    pub principals: PrincipalSet,
+    pub operations: Vec<OperationRule>,
+    #[serde(default)]
+    pub mutability: Mutability,
+    #[serde(default)]
+    pub lifecycle: Lifecycle,
 }
 
-#[derive(Serialize)]
-struct DeleteSecretClaims<'a> {
-    name: &'a str,
+/// JWT minted by `IssueApprovalToken`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalToken {
+    pub jwt: String,
 }
 
-#[derive(Serialize)]
-struct UpdateSecretPolicyClaims<'a> {
-    name: &'a str,
-    policy: &'a SecretPolicy,
+/// Staged-but-not-promoted attestation profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingProfile {
+    pub id: u32,
+    pub profile: AttestationProfile,
+    pub source: PendingProfileSource,
+    pub staged_at: u64,
+    pub staged_by_sub: String,
 }
 
-// ---------------------------------------------------------------------------
-//  VaultClient
-// ---------------------------------------------------------------------------
+/// Public metadata for a key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyInfo {
+    pub handle: String,
+    pub key_type: KeyType,
+    pub exportable: bool,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub policy_version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_key: Vec<u8>,
+}
 
-/// High-level vault client that distributes secrets across multiple SGX vault
-/// instances using Shamir Secret Sharing.
+/// One entry from `VaultRequest::ListKeys`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyListEntry {
+    pub handle: String,
+    pub key_type: KeyType,
+    pub expires_at: u64,
+}
+
+/// One row from the per-key audit log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub seq: u64,
+    pub ts: u64,
+    pub op: String,
+    pub caller: String,
+    pub decision: AuditDecision,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+// ----------------------------------------------------------------------
+//  Request / Response envelopes
+// ----------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "_dummy")]
+enum _SerdeAnchor {} // unused — kept to remind that VaultRequest is hand-shaped
+
+#[derive(Debug, Serialize)]
+enum VaultRequest<'a> {
+    CreateKey {
+        handle: &'a str,
+        key_type: KeyType,
+        material_b64: String,
+        exportable: bool,
+        policy: &'a KeyPolicy,
+    },
+    ExportKey {
+        handle: &'a str,
+        approvals: &'a [ApprovalToken],
+    },
+    DeleteKey {
+        handle: &'a str,
+        approvals: &'a [ApprovalToken],
+    },
+    UpdatePolicy {
+        handle: &'a str,
+        new_policy: &'a KeyPolicy,
+        approvals: &'a [ApprovalToken],
+    },
+    GetPolicy {
+        handle: &'a str,
+    },
+    GetKeyInfo {
+        handle: &'a str,
+    },
+    ListKeys,
+    Wrap {
+        handle: &'a str,
+        plaintext_b64: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aad_b64: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        iv_b64: Option<String>,
+        approvals: &'a [ApprovalToken],
+    },
+    Unwrap {
+        handle: &'a str,
+        ciphertext_b64: String,
+        iv_b64: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aad_b64: Option<String>,
+        approvals: &'a [ApprovalToken],
+    },
+    Sign {
+        handle: &'a str,
+        message_b64: String,
+        approvals: &'a [ApprovalToken],
+    },
+    Mac {
+        handle: &'a str,
+        message_b64: String,
+        approvals: &'a [ApprovalToken],
+    },
+    IssueApprovalToken {
+        handle: &'a str,
+        op: Operation,
+        ttl_seconds: u64,
+    },
+    ReadAuditLog {
+        handle: &'a str,
+        since_seq: u64,
+        limit: u32,
+    },
+    StagePendingProfile {
+        handle: &'a str,
+        profile: &'a AttestationProfile,
+        source: PendingProfileSource,
+    },
+    ListPendingProfiles {
+        handle: &'a str,
+    },
+    PromotePendingProfile {
+        handle: &'a str,
+        pending_id: u32,
+        approvals: &'a [ApprovalToken],
+    },
+    RevokePendingProfile {
+        handle: &'a str,
+        pending_id: u32,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // serde reads every field; not all are exposed by the SDK API
+enum VaultResponse {
+    KeyCreated {
+        handle: String,
+        expires_at: u64,
+    },
+    KeyMaterial {
+        material: Vec<u8>,
+        expires_at: u64,
+    },
+    KeyDeleted,
+    PolicyUpdated {
+        policy_version: u32,
+    },
+    Policy {
+        policy: KeyPolicy,
+        policy_version: u32,
+    },
+    KeyInfo(KeyInfo),
+    KeyList {
+        keys: Vec<KeyListEntry>,
+    },
+    Wrapped {
+        ciphertext: Vec<u8>,
+        iv: Vec<u8>,
+    },
+    Unwrapped {
+        plaintext: Vec<u8>,
+    },
+    Signature {
+        signature: Vec<u8>,
+        alg: String,
+    },
+    MacTag {
+        mac: Vec<u8>,
+        alg: String,
+    },
+    ApprovalTokenIssued(ApprovalToken),
+    AuditLog {
+        entries: Vec<AuditEntry>,
+        next_seq: u64,
+    },
+    PendingProfileStaged {
+        pending_id: u32,
+    },
+    PendingProfileList {
+        pending: Vec<PendingProfile>,
+    },
+    PendingProfilePromoted {
+        policy_version: u32,
+    },
+    PendingProfileRevoked,
+    Error(String),
+}
+
+// ===========================================================================
+//  AuthTokenSource
+// ===========================================================================
+
+/// Provides a fresh OIDC bearer token for vault calls.
 ///
-/// - **Store/Delete/UpdatePolicy**: authenticated via ES256 JWT (secret owner)
-/// - **GetSecret**: authenticated via mutual RA-TLS (client cert with quote)
-pub struct VaultClient {
-    endpoints: Vec<VaultEndpoint>,
-    threshold: usize,
-    signing_key: EcdsaKeyPair,
-    ca_cert_pem: Option<String>,
-    vault_policy: Option<VerificationPolicy>,
-    /// Client certificate chain (DER, leaf first) for mutual RA-TLS.
-    client_cert_der: Option<Vec<Vec<u8>>>,
-    /// PKCS#8-encoded private key for the client certificate.
-    client_key_pkcs8: Option<Vec<u8>>,
-    rng: SystemRandom,
+/// Returning `None` (or `""`) suppresses the `Authorization` header — only
+/// useful against an unauth'd dev vault.
+pub trait AuthTokenSource: Send + Sync {
+    fn token(&self) -> Result<Option<String>>;
 }
 
-impl VaultClient {
-    /// Create a new vault client.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the signing key is invalid or configuration
-    /// constraints are violated.
-    pub fn new(config: VaultClientConfig) -> Result<Self, String> {
-        if config.endpoints.is_empty() {
-            return Err("at least one vault endpoint required".into());
-        }
-        if config.threshold < 2 {
-            return Err("threshold must be >= 2".into());
-        }
-        if config.threshold > config.endpoints.len() {
-            return Err("threshold must be <= number of endpoints".into());
-        }
+/// Static bearer string (useful for tests).
+pub struct StaticToken(pub String);
 
-        let rng = SystemRandom::new();
-        let signing_key = EcdsaKeyPair::from_pkcs8(
-            &ECDSA_P256_SHA256_FIXED_SIGNING,
-            &config.signing_key_pkcs8,
-            &rng,
-        )
-        .map_err(|e| format!("invalid PKCS#8 signing key: {e}"))?;
-
-        Ok(Self {
-            endpoints: config.endpoints,
-            threshold: config.threshold,
-            signing_key,
-            ca_cert_pem: config.ca_cert_pem,
-            vault_policy: config.vault_policy,
-            client_cert_der: config.client_cert_der,
-            client_key_pkcs8: config.client_key_pkcs8,
-            rng,
+impl AuthTokenSource for StaticToken {
+    fn token(&self) -> Result<Option<String>> {
+        Ok(if self.0.is_empty() {
+            None
+        } else {
+            Some(self.0.clone())
         })
     }
+}
 
-    /// Store a secret using Shamir Secret Sharing across all vault endpoints.
-    ///
-    /// The secret is split into `M` shares (one per endpoint) with the
-    /// configured threshold `N`.  Each vault stores one share under the
-    /// same `name`.  The share index is embedded as the first byte.
-    ///
-    /// Returns one [`EndpointResult`] per endpoint.
-    pub fn store_secret(
-        &self,
-        name: &str,
-        secret: &[u8],
-        policy: &SecretPolicy,
-    ) -> Result<Vec<EndpointResult>, String> {
-        let num_shares = self.endpoints.len();
-        let shares = shamir::split(secret, self.threshold, num_shares)?;
+// ===========================================================================
+//  Per-vault Client
+// ===========================================================================
 
-        let mut results = Vec::with_capacity(num_shares);
+/// Configuration for a single-vault [`Client`].
+pub struct DialOptions {
+    /// Supplies the OIDC bearer token sent on every request.
+    pub auth: Option<Box<dyn AuthTokenSource>>,
 
-        for (i, endpoint) in self.endpoints.iter().enumerate() {
-            let share_bytes = shares[i].to_bytes();
-            let share_b64 = URL_SAFE_NO_PAD.encode(&share_bytes);
+    /// Optional PEM CA file used to verify the vault's outer TLS certificate
+    /// (in addition to RA-TLS quote checks).
+    pub ca_cert_pem: Option<String>,
 
-            let claims = StoreSecretClaims {
-                name,
-                secret: share_b64,
-                policy,
-            };
+    /// RA-TLS verification policy. When `None`, quote verification is
+    /// skipped — only safe for local development.
+    pub vault_policy: Option<VerificationPolicy>,
 
-            let jwt = self.build_jwt(&claims)?;
-            let vault_req = VaultRequest::StoreSecret { jwt };
+    /// Static RA-TLS client certificate chain (DER, leaf first) for mutual
+    /// attestation (e.g. enclave-to-vault calls).
+    pub client_cert_der: Option<Vec<Vec<u8>>>,
 
-            match self.send_vault_request(endpoint, &vault_req) {
-                Ok(VaultResponse::SecretStored { expires_at, .. }) => {
-                    results.push(EndpointResult {
-                        endpoint: endpoint.to_string(),
-                        success: true,
-                        error: None,
-                        expires_at: Some(expires_at),
-                    });
-                }
-                Ok(VaultResponse::Error(e)) => {
-                    results.push(EndpointResult {
-                        endpoint: endpoint.to_string(),
-                        success: false,
-                        error: Some(e),
-                        expires_at: None,
-                    });
-                }
-                Ok(other) => {
-                    results.push(EndpointResult {
-                        endpoint: endpoint.to_string(),
-                        success: false,
-                        error: Some(format!("unexpected response: {:?}", other)),
-                        expires_at: None,
-                    });
-                }
-                Err(e) => {
-                    results.push(EndpointResult {
-                        endpoint: endpoint.to_string(),
-                        success: false,
-                        error: Some(e),
-                        expires_at: None,
-                    });
-                }
-            }
+    /// PKCS#8 DER-encoded private key matching `client_cert_der`.
+    pub client_key_pkcs8: Option<Vec<u8>>,
+}
+
+impl Default for DialOptions {
+    fn default() -> Self {
+        Self {
+            auth: None,
+            ca_cert_pem: None,
+            vault_policy: None,
+            client_cert_der: None,
+            client_key_pkcs8: None,
         }
+    }
+}
 
-        // Warn if fewer than threshold succeeded
-        let ok_count = results.iter().filter(|r| r.success).count();
-        if ok_count < self.threshold {
-            return Err(format!(
-                "only {ok_count}/{num_shares} vaults stored successfully \
-                 (need >= {} for reconstruction)",
-                self.threshold
-            ));
-        }
+/// Authenticated session against a single vault instance.
+pub struct Client {
+    registration: VaultRegistration,
+    opts: DialOptions,
+    conn: Mutex<Option<RaTlsClient>>,
+}
 
-        Ok(results)
+impl Client {
+    /// Open an RA-TLS connection to a single vault.
+    pub fn dial(reg: VaultRegistration, opts: DialOptions) -> Result<Self> {
+        let mut c = Self {
+            registration: reg,
+            opts,
+            conn: Mutex::new(None),
+        };
+        c.connect_locked()?;
+        Ok(c)
     }
 
-    /// Retrieve and reconstruct a secret from vault endpoints.
-    ///
-    /// Contacts endpoints in order until `threshold` shares are collected,
-    /// then reconstructs the original secret via Shamir interpolation.
-    ///
-    /// Attestation is provided via mutual RA-TLS: the client certificate
-    /// configured in [`VaultClientConfig::client_cert_der`] is presented
-    /// during the TLS handshake.  The vault extracts the SGX/TDX quote
-    /// and OID claims from that certificate.
-    ///
-    /// A `bearer_token` may still be required depending on the secret's
-    /// policy (when `manager_pubkey` is set).
-    pub fn get_secret(
-        &self,
-        name: &str,
-        bearer_token: Option<&[u8]>,
-    ) -> Result<ReconstructedSecret, String> {
-        let mut collected_shares: Vec<shamir::Share> = Vec::new();
-        let mut min_expiry = u64::MAX;
-        let mut errors: Vec<String> = Vec::new();
-
-        for endpoint in &self.endpoints {
-            if collected_shares.len() >= self.threshold {
-                break;
-            }
-
-            let vault_req = VaultRequest::GetSecret {
-                name: name.to_string(),
-                bearer_token: bearer_token.map(|t| t.to_vec()),
-            };
-
-            match self.send_vault_request_mutual(endpoint, &vault_req) {
-                Ok(VaultResponse::SecretValue { secret, expires_at }) => {
-                    match shamir::Share::from_bytes(&secret) {
-                        Ok(share) => {
-                            if expires_at < min_expiry {
-                                min_expiry = expires_at;
-                            }
-                            collected_shares.push(share);
-                        }
-                        Err(e) => {
-                            errors.push(format!("{endpoint}: bad share: {e}"));
-                        }
-                    }
-                }
-                Ok(VaultResponse::Error(e)) => {
-                    errors.push(format!("{endpoint}: {e}"));
-                }
-                Ok(other) => {
-                    errors.push(format!("{endpoint}: unexpected: {:?}", other));
-                }
-                Err(e) => {
-                    errors.push(format!("{endpoint}: {e}"));
-                }
-            }
-        }
-
-        if collected_shares.len() < self.threshold {
-            return Err(format!(
-                "collected only {}/{} shares (need {}). Errors: {}",
-                collected_shares.len(),
-                self.endpoints.len(),
-                self.threshold,
-                errors.join("; ")
-            ));
-        }
-
-        let secret = shamir::reconstruct(&collected_shares)?;
-
-        Ok(ReconstructedSecret {
-            secret,
-            expires_at: min_expiry,
-        })
+    /// Underlying registration record.
+    pub fn registration(&self) -> &VaultRegistration {
+        &self.registration
     }
 
-    /// Delete a secret from all vault endpoints.
-    ///
-    /// Returns one [`EndpointResult`] per endpoint.  Partial failures are
-    /// reported but do not prevent other endpoints from being contacted.
-    pub fn delete_secret(&self, name: &str) -> Result<Vec<EndpointResult>, String> {
-        let claims = DeleteSecretClaims { name };
-        let jwt = self.build_jwt(&claims)?;
-        let vault_req = VaultRequest::DeleteSecret { jwt };
-        Ok(self.broadcast_request(&vault_req))
+    fn connect_locked(&mut self) -> Result<()> {
+        let conn = self.open_connection()?;
+        *self.conn.lock().unwrap() = Some(conn);
+        Ok(())
     }
 
-    /// Update the access policy for a secret on all vault endpoints.
-    ///
-    /// Returns one [`EndpointResult`] per endpoint.
-    pub fn update_policy(
-        &self,
-        name: &str,
-        policy: &SecretPolicy,
-    ) -> Result<Vec<EndpointResult>, String> {
-        let claims = UpdateSecretPolicyClaims { name, policy };
-        let jwt = self.build_jwt(&claims)?;
-        let vault_req = VaultRequest::UpdateSecretPolicy { jwt };
-        Ok(self.broadcast_request(&vault_req))
-    }
+    fn open_connection(&self) -> Result<RaTlsClient> {
+        let ca = self.opts.ca_cert_pem.as_deref();
+        let host = self.registration.host();
+        let port = self.registration.port();
 
-    // -----------------------------------------------------------------------
-    //  Internal helpers
-    // -----------------------------------------------------------------------
-
-    /// Send a vault request to all endpoints, collecting results.
-    fn broadcast_request(&self, vault_req: &VaultRequest) -> Vec<EndpointResult> {
-        let mut results = Vec::with_capacity(self.endpoints.len());
-        for endpoint in &self.endpoints {
-            match self.send_vault_request(endpoint, vault_req) {
-                Ok(VaultResponse::SecretDeleted) | Ok(VaultResponse::PolicyUpdated) => {
-                    results.push(EndpointResult {
-                        endpoint: endpoint.to_string(),
-                        success: true,
-                        error: None,
-                        expires_at: None,
-                    });
-                }
-                Ok(VaultResponse::Error(e)) => {
-                    results.push(EndpointResult {
-                        endpoint: endpoint.to_string(),
-                        success: false,
-                        error: Some(e),
-                        expires_at: None,
-                    });
-                }
-                Ok(other) => {
-                    results.push(EndpointResult {
-                        endpoint: endpoint.to_string(),
-                        success: false,
-                        error: Some(format!("unexpected response: {:?}", other)),
-                        expires_at: None,
-                    });
-                }
-                Err(e) => {
-                    results.push(EndpointResult {
-                        endpoint: endpoint.to_string(),
-                        success: false,
-                        error: Some(e),
-                        expires_at: None,
-                    });
-                }
-            }
-        }
-        results
-    }
-
-    /// Connect to a vault endpoint via RA-TLS, send a VaultRequest, and
-    /// decode the VaultResponse.
-    fn send_vault_request(
-        &self,
-        endpoint: &VaultEndpoint,
-        vault_req: &VaultRequest,
-    ) -> Result<VaultResponse, String> {
-        let ca = self.ca_cert_pem.as_deref();
-        let mut client = RaTlsClient::connect(&endpoint.host, endpoint.port, ca)
-            .map_err(|e| format!("connect to {endpoint}: {e}"))?;
-
-        // Optionally verify the vault's RA-TLS certificate
-        if let Some(ref policy) = self.vault_policy {
-            client
-                .verify_certificate(policy)
-                .map_err(|e| format!("RA-TLS verify {endpoint}: {e}"))?;
-        }
-
-        let payload = serde_json::to_vec(vault_req)
-            .map_err(|e| format!("serialise request: {e}"))?;
-
-        let resp_bytes = client
-            .send_data(&payload)
-            .map_err(|e| format!("send to {endpoint}: {e}"))?;
-
-        let vault_resp: VaultResponse = serde_json::from_slice(&resp_bytes)
-            .map_err(|e| format!("parse response from {endpoint}: {e}"))?;
-
-        Ok(vault_resp)
-    }
-
-    /// Connect to a vault endpoint via mutual RA-TLS (presenting a client
-    /// certificate), send a VaultRequest, and decode the VaultResponse.
-    ///
-    /// Used for `GetSecret` where the vault requires the caller's RA-TLS
-    /// certificate to extract attestation evidence.
-    fn send_vault_request_mutual(
-        &self,
-        endpoint: &VaultEndpoint,
-        vault_req: &VaultRequest,
-    ) -> Result<VaultResponse, String> {
-        let ca = self.ca_cert_pem.as_deref();
-
-        let mut client = match (&self.client_cert_der, &self.client_key_pkcs8) {
-            (Some(cert_chain), Some(key)) => {
-                RaTlsClient::connect_mutual(
-                    &endpoint.host,
-                    endpoint.port,
-                    ca,
-                    cert_chain.clone(),
-                    key.clone(),
-                )
-                .map_err(|e| format!("mutual RA-TLS connect to {endpoint}: {e}"))?
-            }
-            _ => {
-                return Err(format!(
-                    "mutual RA-TLS required for GetSecret but no client_cert_der/client_key_pkcs8 configured"
-                ))
-            }
+        let conn = match (&self.opts.client_cert_der, &self.opts.client_key_pkcs8) {
+            (Some(chain), Some(key)) => RaTlsClient::connect_mutual(
+                host,
+                port,
+                ca,
+                chain.clone(),
+                key.clone(),
+            )
+            .map_err(|e| Error::Transport(format!("mutual ratls dial {host}:{port}: {e}")))?,
+            _ => RaTlsClient::connect(host, port, ca)
+                .map_err(|e| Error::Transport(format!("ratls dial {host}:{port}: {e}")))?,
         };
 
-        // Optionally verify the vault's RA-TLS certificate
-        if let Some(ref policy) = self.vault_policy {
-            client
-                .verify_certificate(policy)
-                .map_err(|e| format!("RA-TLS verify {endpoint}: {e}"))?;
+        if let Some(policy) = &self.opts.vault_policy {
+            conn.verify_certificate(policy)
+                .map_err(|e| Error::Transport(format!("ratls verify {host}:{port}: {e}")))?;
         }
 
-        let payload = serde_json::to_vec(vault_req)
-            .map_err(|e| format!("serialise request: {e}"))?;
-
-        let resp_bytes = client
-            .send_data(&payload)
-            .map_err(|e| format!("send to {endpoint}: {e}"))?;
-
-        let vault_resp: VaultResponse = serde_json::from_slice(&resp_bytes)
-            .map_err(|e| format!("parse response from {endpoint}: {e}"))?;
-
-        Ok(vault_resp)
+        Ok(conn)
     }
 
-    /// Build a compact JWS (ES256) from claims.
-    ///
-    /// Format: `base64url(header).base64url(payload).base64url(signature)`
-    /// where signature is the raw `r || s` (64 bytes) from P-256.
-    fn build_jwt(&self, claims: &impl Serialize) -> Result<Vec<u8>, String> {
-        let header = r#"{"alg":"ES256","typ":"JWT"}"#;
-        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+    /// Send a `VaultRequest` and decode the `VaultResponse`. Retries once
+    /// on transport failure with a fresh connection.
+    fn call(&self, req: &VaultRequest<'_>) -> Result<VaultResponse> {
+        let payload =
+            serde_json::to_vec(req).map_err(|e| Error::Codec(format!("serialise: {e}")))?;
 
-        let claims_json =
-            serde_json::to_vec(claims).map_err(|e| format!("serialise JWT claims: {e}"))?;
-        let claims_b64 = URL_SAFE_NO_PAD.encode(&claims_json);
+        let token = match &self.opts.auth {
+            Some(src) => src.token()?,
+            None => None,
+        };
+        let token_ref = token.as_deref();
 
-        let signing_input = format!("{header_b64}.{claims_b64}");
+        let body = {
+            let mut guard = self.conn.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some(self.open_connection()?);
+            }
 
-        let sig = self
-            .signing_key
-            .sign(&self.rng, signing_input.as_bytes())
-            .map_err(|_| "ES256 signing failed".to_string())?;
+            let first_err = match guard
+                .as_mut()
+                .unwrap()
+                .send_data(&payload, token_ref)
+            {
+                Ok(b) => return decode_response(&b),
+                Err(e) => e,
+            };
 
-        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_ref());
-        let jwt = format!("{signing_input}.{sig_b64}");
+            // Retry once on transport error with a fresh connection.
+            *guard = None;
+            *guard = Some(self.open_connection().map_err(|e| {
+                Error::Transport(format!(
+                    "send failed ({first_err}); reconnect failed: {e}"
+                ))
+            })?);
+            guard
+                .as_mut()
+                .unwrap()
+                .send_data(&payload, token_ref)
+                .map_err(|e| Error::Transport(format!("send: {e}")))?
+        };
 
-        Ok(jwt.into_bytes())
+        decode_response(&body)
+    }
+
+    // -------------------------------------------------------------------
+    //  Operations
+    // -------------------------------------------------------------------
+
+    /// Store a new key. Returns the expiry (unix seconds) on success.
+    pub fn create_key(
+        &self,
+        handle: &str,
+        key_type: KeyType,
+        material: &[u8],
+        exportable: bool,
+        policy: &KeyPolicy,
+    ) -> Result<u64> {
+        let resp = self.call(&VaultRequest::CreateKey {
+            handle,
+            key_type,
+            material_b64: URL_SAFE_NO_PAD.encode(material),
+            exportable,
+            policy,
+        })?;
+        match resp {
+            VaultResponse::KeyCreated { expires_at, .. } => Ok(expires_at),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Export raw key material (only when `exportable` and the policy
+    /// grants `ExportKey` to the caller).
+    pub fn export_key(&self, handle: &str, approvals: &[ApprovalToken]) -> Result<Vec<u8>> {
+        match self.call(&VaultRequest::ExportKey { handle, approvals })? {
+            VaultResponse::KeyMaterial { material, .. } => Ok(material),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Delete a key and its policy.
+    pub fn delete_key(&self, handle: &str, approvals: &[ApprovalToken]) -> Result<()> {
+        match self.call(&VaultRequest::DeleteKey { handle, approvals })? {
+            VaultResponse::KeyDeleted => Ok(()),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Replace the policy on an existing key. Returns the new
+    /// `policy_version`.
+    pub fn update_policy(
+        &self,
+        handle: &str,
+        new_policy: &KeyPolicy,
+        approvals: &[ApprovalToken],
+    ) -> Result<u32> {
+        match self.call(&VaultRequest::UpdatePolicy {
+            handle,
+            new_policy,
+            approvals,
+        })? {
+            VaultResponse::PolicyUpdated { policy_version } => Ok(policy_version),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Read the current policy + version for a key.
+    pub fn get_policy(&self, handle: &str) -> Result<(KeyPolicy, u32)> {
+        match self.call(&VaultRequest::GetPolicy { handle })? {
+            VaultResponse::Policy {
+                policy,
+                policy_version,
+            } => Ok((policy, policy_version)),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Read public metadata for a key.
+    pub fn get_key_info(&self, handle: &str) -> Result<KeyInfo> {
+        match self.call(&VaultRequest::GetKeyInfo { handle })? {
+            VaultResponse::KeyInfo(info) => Ok(info),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// List all keys owned by the caller.
+    pub fn list_keys(&self) -> Result<Vec<KeyListEntry>> {
+        match self.call(&VaultRequest::ListKeys)? {
+            VaultResponse::KeyList { keys } => Ok(keys),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Encrypt under an `Aes256GcmKey`. Returns `(ciphertext, iv)`.
+    pub fn wrap(
+        &self,
+        handle: &str,
+        plaintext: &[u8],
+        aad: Option<&[u8]>,
+        iv: Option<&[u8]>,
+        approvals: &[ApprovalToken],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let req = VaultRequest::Wrap {
+            handle,
+            plaintext_b64: URL_SAFE_NO_PAD.encode(plaintext),
+            aad_b64: aad.map(|a| URL_SAFE_NO_PAD.encode(a)),
+            iv_b64: iv.map(|i| URL_SAFE_NO_PAD.encode(i)),
+            approvals,
+        };
+        match self.call(&req)? {
+            VaultResponse::Wrapped { ciphertext, iv } => Ok((ciphertext, iv)),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Decrypt under an `Aes256GcmKey`.
+    pub fn unwrap(
+        &self,
+        handle: &str,
+        ciphertext: &[u8],
+        iv: &[u8],
+        aad: Option<&[u8]>,
+        approvals: &[ApprovalToken],
+    ) -> Result<Vec<u8>> {
+        let req = VaultRequest::Unwrap {
+            handle,
+            ciphertext_b64: URL_SAFE_NO_PAD.encode(ciphertext),
+            iv_b64: URL_SAFE_NO_PAD.encode(iv),
+            aad_b64: aad.map(|a| URL_SAFE_NO_PAD.encode(a)),
+            approvals,
+        };
+        match self.call(&req)? {
+            VaultResponse::Unwrapped { plaintext } => Ok(plaintext),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Produce an IEEE P1363 ECDSA-P256-SHA256 signature.
+    pub fn sign(
+        &self,
+        handle: &str,
+        message: &[u8],
+        approvals: &[ApprovalToken],
+    ) -> Result<(Vec<u8>, String)> {
+        match self.call(&VaultRequest::Sign {
+            handle,
+            message_b64: URL_SAFE_NO_PAD.encode(message),
+            approvals,
+        })? {
+            VaultResponse::Signature { signature, alg } => Ok((signature, alg)),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Produce an HMAC-SHA-256 tag.
+    pub fn mac(
+        &self,
+        handle: &str,
+        message: &[u8],
+        approvals: &[ApprovalToken],
+    ) -> Result<(Vec<u8>, String)> {
+        match self.call(&VaultRequest::Mac {
+            handle,
+            message_b64: URL_SAFE_NO_PAD.encode(message),
+            approvals,
+        })? {
+            VaultResponse::MacTag { mac, alg } => Ok((mac, alg)),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Mint an approval token for an operation. Caller must be a manager
+    /// in the policy. `ttl_seconds = 0` → vault default.
+    pub fn issue_approval_token(
+        &self,
+        handle: &str,
+        op: Operation,
+        ttl_seconds: u64,
+    ) -> Result<ApprovalToken> {
+        match self.call(&VaultRequest::IssueApprovalToken {
+            handle,
+            op,
+            ttl_seconds,
+        })? {
+            VaultResponse::ApprovalTokenIssued(t) => Ok(t),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Fetch audit entries with `seq > since_seq` (up to `limit`).
+    pub fn read_audit_log(
+        &self,
+        handle: &str,
+        since_seq: u64,
+        limit: u32,
+    ) -> Result<(Vec<AuditEntry>, u64)> {
+        match self.call(&VaultRequest::ReadAuditLog {
+            handle,
+            since_seq,
+            limit,
+        })? {
+            VaultResponse::AuditLog { entries, next_seq } => Ok((entries, next_seq)),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Stage an attestation profile on this vault. Returns the
+    /// `pending_id` (vault-local).
+    pub fn stage_pending_profile(
+        &self,
+        handle: &str,
+        profile: &AttestationProfile,
+        source: PendingProfileSource,
+    ) -> Result<u32> {
+        match self.call(&VaultRequest::StagePendingProfile {
+            handle,
+            profile,
+            source,
+        })? {
+            VaultResponse::PendingProfileStaged { pending_id } => Ok(pending_id),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// List currently-staged profiles for a key.
+    pub fn list_pending_profiles(&self, handle: &str) -> Result<Vec<PendingProfile>> {
+        match self.call(&VaultRequest::ListPendingProfiles { handle })? {
+            VaultResponse::PendingProfileList { pending } => Ok(pending),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Promote a pending profile into `principals.tees`. Returns the new
+    /// `policy_version`.
+    pub fn promote_pending_profile(
+        &self,
+        handle: &str,
+        pending_id: u32,
+        approvals: &[ApprovalToken],
+    ) -> Result<u32> {
+        match self.call(&VaultRequest::PromotePendingProfile {
+            handle,
+            pending_id,
+            approvals,
+        })? {
+            VaultResponse::PendingProfilePromoted { policy_version } => Ok(policy_version),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Drop a pending profile without promoting it.
+    pub fn revoke_pending_profile(&self, handle: &str, pending_id: u32) -> Result<()> {
+        match self.call(&VaultRequest::RevokePendingProfile { handle, pending_id })? {
+            VaultResponse::PendingProfileRevoked => Ok(()),
+            _ => Err(Error::UnexpectedResponse),
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-//  Convenience: create a SecretPolicy builder
-// ---------------------------------------------------------------------------
+// ===========================================================================
+//  Decode helper (handles serde's bare-string unit-variant encoding)
+// ===========================================================================
 
-impl SecretPolicy {
-    /// Create a new empty policy (denies all access — add measurements).
-    pub fn new() -> Self {
+fn decode_response(body: &[u8]) -> Result<VaultResponse> {
+    // Serde encodes unit enum variants as bare JSON strings (e.g.
+    // `"KeyDeleted"`). Inflate those to `{"KeyDeleted": null}` for
+    // serde_json's tag dispatch.
+    let trimmed_len = body.iter().rev().take_while(|b| b.is_ascii_whitespace()).count();
+    let body = &body[..body.len() - trimmed_len];
+    let body = body.iter().position(|b| !b.is_ascii_whitespace()).map_or(body, |i| &body[i..]);
+
+    let resp: VaultResponse = if body.first() == Some(&b'"') && body.last() == Some(&b'"') {
+        let variant = std::str::from_utf8(&body[1..body.len() - 1])
+            .map_err(|e| Error::Codec(format!("non-utf8 variant: {e}")))?;
+        let inflated = format!(r#"{{"{variant}":null}}"#);
+        serde_json::from_str(&inflated)
+            .map_err(|e| Error::Codec(format!("inflate {variant}: {e}")))?
+    } else {
+        serde_json::from_slice(body)
+            .map_err(|e| Error::Codec(format!("parse response: {e}")))?
+    };
+
+    if let VaultResponse::Error(msg) = resp {
+        return Err(Error::Vault(msg));
+    }
+    Ok(resp)
+}
+
+// ===========================================================================
+//  Constellation — fan-out across all live vaults
+// ===========================================================================
+
+/// Outcome of one fan-out operation against one vault.
+pub struct EndpointResult {
+    pub vault: VaultRegistration,
+    pub result: Result<EndpointPayload>,
+}
+
+/// Per-operation success payload returned by [`Constellation`] fan-outs.
+pub enum EndpointPayload {
+    /// Returned by `stage_pending_profile`.
+    PendingId(u32),
+    /// Returned by `promote_pending_profile`.
+    PolicyVersion(u32),
+    /// Returned by `list_pending_profiles`.
+    Pending(Vec<PendingProfile>),
+    /// Returned by `revoke_pending_profile` (no payload).
+    Empty,
+}
+
+/// Fan-out helper for cross-vault operations.
+///
+/// Each call to a `Constellation` method:
+///
+///  1. Lists vaults from the registry.
+///  2. Dials each one in turn (sequentially, dropping the connection
+///     before moving on).
+///  3. Returns one [`EndpointResult`] per vault.
+pub struct Constellation {
+    pub registry: RegistryClient,
+    /// Builder closure invoked once per vault to produce a fresh
+    /// [`DialOptions`]. Required because [`AuthTokenSource`] is not `Clone`.
+    pub dial: Box<dyn Fn() -> DialOptions + Send + Sync>,
+}
+
+impl Constellation {
+    /// Construct a `Constellation`.
+    pub fn new(
+        registry: RegistryClient,
+        dial: impl Fn() -> DialOptions + Send + Sync + 'static,
+    ) -> Self {
         Self {
-            allowed_mrenclave: Vec::new(),
-            allowed_mrtd: Vec::new(),
-            manager_pubkey: None,
-            required_oids: Vec::new(),
-            ttl_seconds: 0, // will default to 30 days
+            registry,
+            dial: Box::new(dial),
         }
     }
 
-    /// Add an allowed SGX MRENCLAVE (hex-encoded, 64 chars).
-    pub fn allow_mrenclave(mut self, mrenclave: &str) -> Self {
-        self.allowed_mrenclave.push(mrenclave.to_lowercase());
-        self
+    fn for_each<F>(&self, mut f: F) -> Result<Vec<EndpointResult>>
+    where
+        F: FnMut(&Client) -> Result<EndpointPayload>,
+    {
+        let vaults = self.registry.list_vaults()?;
+        if vaults.is_empty() {
+            return Err(Error::Registry("no vaults registered".into()));
+        }
+        let mut out = Vec::with_capacity(vaults.len());
+        for v in vaults {
+            let opts = (self.dial)();
+            let res = match Client::dial(v.clone(), opts) {
+                Ok(c) => f(&c),
+                Err(e) => Err(e),
+            };
+            out.push(EndpointResult { vault: v, result: res });
+        }
+        Ok(out)
     }
 
-    /// Add an allowed TDX MRTD (hex-encoded, 96 chars).
-    pub fn allow_mrtd(mut self, mrtd: &str) -> Self {
-        self.allowed_mrtd.push(mrtd.to_lowercase());
-        self
+    /// Stage `profile` on every live vault.
+    pub fn stage_pending_profile(
+        &self,
+        handle: &str,
+        profile: &AttestationProfile,
+        source: PendingProfileSource,
+    ) -> Result<Vec<EndpointResult>> {
+        self.for_each(|c| {
+            c.stage_pending_profile(handle, profile, source)
+                .map(EndpointPayload::PendingId)
+        })
     }
 
-    /// Set the manager's public key (hex-encoded uncompressed P-256, 65 bytes).
-    ///
-    /// When set, `GetSecret` requires a bearer token that is a valid ES256
-    /// JWT signed by the manager's corresponding private key.  The JWT
-    /// payload must contain `{ "name": "<secret-name>" }` matching the
-    /// requested secret.
-    pub fn manager_pubkey(mut self, pubkey_hex: &str) -> Self {
-        self.manager_pubkey = Some(pubkey_hex.to_lowercase());
-        self
+    /// Query every live vault for pending profiles on `handle`.
+    pub fn list_pending_profiles(&self, handle: &str) -> Result<Vec<EndpointResult>> {
+        self.for_each(|c| c.list_pending_profiles(handle).map(EndpointPayload::Pending))
     }
 
-    /// Require an OID value from the caller's RA-TLS certificate.
-    pub fn require_oid(mut self, oid: &str, value: &str) -> Self {
-        self.required_oids.push(OidRequirement {
-            oid: oid.to_string(),
-            value: value.to_lowercase(),
-        });
-        self
+    /// Promote `pending_id` on every live vault, carrying `approvals`.
+    pub fn promote_pending_profile(
+        &self,
+        handle: &str,
+        pending_id: u32,
+        approvals: &[ApprovalToken],
+    ) -> Result<Vec<EndpointResult>> {
+        self.for_each(|c| {
+            c.promote_pending_profile(handle, pending_id, approvals)
+                .map(EndpointPayload::PolicyVersion)
+        })
     }
 
-    /// Set the TTL in seconds (capped at 90 days by the vault).
-    pub fn ttl(mut self, seconds: u64) -> Self {
-        self.ttl_seconds = seconds;
-        self
-    }
-}
-
-impl Default for SecretPolicy {
-    fn default() -> Self {
-        Self::new()
+    /// Revoke `pending_id` on every live vault.
+    pub fn revoke_pending_profile(
+        &self,
+        handle: &str,
+        pending_id: u32,
+    ) -> Result<Vec<EndpointResult>> {
+        self.for_each(|c| {
+            c.revoke_pending_profile(handle, pending_id)
+                .map(|()| EndpointPayload::Empty)
+        })
     }
 }
