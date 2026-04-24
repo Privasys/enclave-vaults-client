@@ -1,160 +1,186 @@
-# Enclave Vaults Client
+# Enclave Vaults — Client SDKs
 
-Client libraries for [Enclave Vaults](https://github.com/Privasys/enclave-vaults) — a distributed secret store running inside hardware-attested enclaves.
+Go and Rust client libraries for [Enclave Vaults](https://github.com/Privasys/enclave-vaults), Privasys's distributed virtual HSM running inside SGX enclaves.
 
-The vault client distributes secrets across multiple vault instances using **Shamir Secret Sharing** and communicates over **RA-TLS** (Remote Attestation TLS) connections. Compromising fewer than the threshold number of vaults reveals nothing about the stored secrets.
+The SDKs talk to a **constellation of independent vault enclaves** over RA-TLS. Each vault enforces a per-key `KeyPolicy`, performs typed HSM operations in-enclave (no raw key material on the wire), and seals state to its own MRENCLAVE. Information-theoretic confidentiality of secrets that opt into Shamir storage is preserved by k-of-n sharding across vaults; for HSM-shaped keys (sign / wrap / derive), each vault holds a full copy of the key under its own seal and the SDK fans calls out.
 
-## Architecture
+The **registry** is a phonebook only: `GET /api/vaults` returns `(endpoint, measurement)` tuples. It never sees keys, shares, policies, pending profiles, approval tokens, or audit data — the SDK does its own RA-TLS handshake and quote verification against each vault directly.
 
-```
- ┌──────────────┐       RA-TLS         ┌─────────────┐
- │              │──── share 1 ────────►│  Vault #1   │
- │  VaultClient │──── share 2 ────────►│  Vault #2   │
- │  (Shamir)    │──── share 3 ────────►│  Vault #3   │
- │              │       ...            │    ...      │
- │              │──── share M ────────►│  Vault #M   │
- └──────────────┘                      └─────────────┘
+## Layout
 
- Reconstruction: any N-of-M shares → original secret
-```
+| Language | Path                                          | Crate / module                                                   |
+| -------- | --------------------------------------------- | ---------------------------------------------------------------- |
+| Go       | [`go/vault/`](go/vault/)                      | `github.com/Privasys/enclave-vaults-client/go/vault`             |
+| Rust     | [`rust/`](rust/) (crate `enclave-vaults-client`) | `enclave_vaults_client::client`                                |
 
-## Available Languages
+Both implementations expose the **same three layers**:
 
-| Language | Path | Status |
-|----------|------|--------|
-| **Go** | [`go/vault/`](go/vault/) | Full client + Shamir SSS |
-| **Rust** | [`rust/`](rust/) | Full client + Shamir SSS |
+| Layer            | Type                                       | Responsibility                                                                                                                |
+| ---------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| Discovery        | `RegistryClient`                           | Plain HTTPS to `https://<registry>/api/vaults`. Returns the live `VaultRegistration` list (host, port, MRENCLAVE).            |
+| Single vault     | `Client` (`Dial(ctx, registration, opts)`) | RA-TLS handshake + quote verification against one vault. Exposes the 16 HSM operations.                                       |
+| Whole constellation | `Constellation` / `NewConstellation(reg, opts)` | Pulls the registry, dials each vault, and fans calls out (Shamir distribution, pending-profile staging/promotion/revoke). |
 
-## Operations
+## The 16 HSM operations
 
-| Operation | Auth Method | Description |
-|-----------|-------------|-------------|
-| `StoreSecret` | ES256 JWT (owner key) | Shamir-split and distribute shares |
-| `GetSecret` | Mutual RA-TLS (client cert) | Collect threshold shares and reconstruct |
-| `DeleteSecret` | ES256 JWT (owner key) | Remove secret from all vaults |
-| `UpdatePolicy` | ES256 JWT (owner key) | Update access policy on all vaults |
+Each `Client` instance is a single RA-TLS session to one vault. All operations are JSON-over-HTTP/1.1 inside the RA-TLS tunnel.
 
-## Shamir Secret Sharing
+| Operation               | Purpose                                                                              | Authenticator                       |
+| ----------------------- | ------------------------------------------------------------------------------------ | ----------------------------------- |
+| `CreateKey`             | Create a typed key with an attached `KeyPolicy`                                      | OIDC owner JWT                      |
+| `ImportKey`             | Import existing material under a `KeyPolicy`                                         | OIDC owner JWT                      |
+| `ExportKey`             | Export raw material (only if `usage.export` and the policy allows)                   | OIDC + optional manager approvals   |
+| `DeleteKey`             | Tombstone a key                                                                      | OIDC + optional manager approvals   |
+| `RotateKey`             | Bump the version, optionally swap policy                                             | OIDC + per-policy `Mutability`      |
+| `ListKeys`              | List handles visible to the caller                                                   | OIDC                                |
+| `GetKeyInfo`            | Metadata + public components only (no sealed material)                               | OIDC or attested TEE                |
+| `Wrap` / `Unwrap`       | AES-256-GCM with sealed KEK; AAD + IV verbatim                                       | Attested TEE (RA-TLS) or OIDC       |
+| `Sign` / `Verify`       | P-256 / Ed25519, hash inside the enclave                                             | Attested TEE or OIDC                |
+| `Mac`                   | HMAC-SHA-256                                                                         | Attested TEE or OIDC                |
+| `UpdatePolicy`          | Diff-style policy update; respects `Mutability` and may need approval tokens         | OIDC + manager approvals            |
+| `GetPolicy`             | Returns the current policy + `policy_version`                                        | OIDC or attested TEE                |
+| `IssueApprovalToken`    | Manager mints a short-lived approval blob for a specific `(handle, op)`              | Manager OIDC (or FIDO2 in the wallet) |
+| `ReadAuditLog`          | Sealed append-only log; one entry per attempted op                                   | OIDC owner / auditor                |
 
-Both implementations use identical parameters:
+Pending-profile lifecycle (used during enclave upgrades) lives on the same `Client`:
 
-- **Field**: GF(2^8) with irreducible polynomial `x^8 + x^4 + x^3 + x + 1` (0x11b, same as AES)
-- **Generator**: g = 3
-- **Threshold**: configurable N-of-M (N ≥ 2, M ≤ 255)
-- **Per-byte**: independent random polynomial of degree (threshold − 1)
+`StagePendingProfile`, `ListPendingProfiles`, `PromotePendingProfile`, `RevokePendingProfile` — and the matching `Constellation` methods that fan them out across the vaults that hold a share of the key.
 
-## Quick Start (Go)
+## OIDC
+
+By default the SDK accepts JWTs from **Privasys ID** (`https://privasys.id`, audience `privasys-platform`, JWKS at `https://privasys.id/jwks`). Roles are matched as raw strings on `claims.roles`:
+
+- `vault:owner` — create / delete / rotate / export their own keys
+- `vault:manager` — co-sign approvals (export, policy changes, profile promotions)
+- `vault:auditor` — read `GetPolicy` + `ReadAuditLog`, nothing else
+
+Bring-your-own IdP is supported by the vault binary (`oidc_issuer_url` + matching `Principal::Oidc { issuer }` in policies); from the SDK side, just pass tokens minted by your IdP via the `TokenSource` interface.
+
+## Go quick start
 
 ```go
-import "github.com/Privasys/enclave-vaults-client/go/vault"
+import (
+    "context"
+    "fmt"
 
-config := vault.VaultClientConfig{
-    Endpoints: []vault.VaultEndpoint{
-        {Host: "vault1.example.com", Port: 8443},
-        {Host: "vault2.example.com", Port: 8443},
-        {Host: "vault3.example.com", Port: 8443},
-    },
-    Threshold:  2,
-    SigningKey:  ownerKey, // *ecdsa.PrivateKey (P-256)
-    CACertPath: "ca.pem",
+    vault "github.com/Privasys/enclave-vaults-client/go/vault"
+)
+
+func main() {
+    ctx := context.Background()
+
+    // 1. Discover the constellation.
+    reg := vault.NewRegistryClient("https://u.registry.vaults.privasys.org")
+
+    // 2. Dial options shared by every vault in the constellation:
+    //    OIDC token source + (optional) custom CA bundle for the attestation server.
+    dial := vault.DialOptions{
+        Token:               vault.StaticToken(os.Getenv("PRIVASYS_ID_JWT")),
+        AttestationServer:   "https://as.privasys.org",
+    }
+
+    // 3a. Talk to one vault directly.
+    vaults, _ := reg.ListVaults(ctx)
+    cli, _ := vault.Dial(ctx, vaults[0], dial)
+    defer cli.Close()
+
+    sig, alg, err := cli.Sign(ctx, "vault:tenant42/release-signer/v1",
+        []byte("payload to sign"), "sha256")
+    fmt.Printf("alg=%s sig_len=%d err=%v\n", alg, len(sig), err)
+
+    // 3b. Or fan out to the whole constellation (Shamir / pending profiles).
+    con := vault.NewConstellation(reg, dial)
+    results, _ := con.StagePendingProfile(ctx, "vault:tenant42/master-kek/v1",
+        vault.AttestationProfile{
+            Name:                      "app:v3 / SGX",
+            Measurements:              []vault.Measurement{vault.Mrenclave("a1b2…")},
+            AttestationServers:        []string{"https://as.privasys.org"},
+            QuoteFreshnessMaxSeconds:  60,
+        },
+        vault.PendingProfileSource{Kind: vault.PendingProfileSourcePlatformBuild},
+    )
+    for _, r := range results {
+        fmt.Printf("%s: ok=%v err=%v pending_id=%d\n",
+            r.Vault.Host(), r.Success, r.Err, r.PendingID)
+    }
 }
-
-client, err := vault.NewVaultClient(config)
-if err != nil {
-    log.Fatal(err)
-}
-
-// Store — splits into 3 shares (threshold 2)
-results, err := client.StoreSecret("my-dek", secretBytes, &vault.SecretPolicy{
-    AllowedMREnclave: []string{"abc123..."},
-    TTLSeconds:       86400 * 30,
-})
-
-// Retrieve — collects 2 shares, reconstructs
-reconstructed, err := client.GetSecret("my-dek", nil)
 ```
 
-## Quick Start (Rust)
+## Rust quick start
 
 ```rust
-use vault_client::client::{VaultClient, VaultClientConfig, VaultEndpoint, SecretPolicy};
-
-let config = VaultClientConfig {
-    endpoints: vec![
-        VaultEndpoint { host: "vault1.example.com".into(), port: 8443 },
-        VaultEndpoint { host: "vault2.example.com".into(), port: 8443 },
-        VaultEndpoint { host: "vault3.example.com".into(), port: 8443 },
-    ],
-    threshold: 2,
-    signing_key_pkcs8: std::fs::read("owner-key.p8")?,
-    ca_cert_pem: Some("ca.pem".into()),
-    vault_policy: None,
-    client_cert_der: None,
-    client_key_pkcs8: None,
+use enclave_vaults_client::client::{
+    AttestationProfile, Constellation, DialOptions, Measurement,
+    PendingProfileSource, RegistryClient, StaticToken, dial,
 };
 
-let client = VaultClient::new(config)?;
+fn main() -> anyhow::Result<()> {
+    // 1. Discover the constellation.
+    let reg = RegistryClient::new("https://u.registry.vaults.privasys.org");
 
-// Store
-let policy = SecretPolicy::new()
-    .allow_mrenclave("abc123...")
-    .ttl(86400 * 30);
-let results = client.store_secret("my-dek", &secret, &policy)?;
+    // 2. Dial options shared by every vault.
+    let opts = DialOptions {
+        token: Some(Box::new(StaticToken(std::env::var("PRIVASYS_ID_JWT")?))),
+        attestation_server: Some("https://as.privasys.org".into()),
+        ..Default::default()
+    };
 
-// Retrieve
-let reconstructed = client.get_secret("my-dek", None)?;
+    // 3a. One vault.
+    let vaults = reg.list_vaults()?;
+    let mut cli = dial(&vaults[0], &opts)?;
+    let (sig, alg) = cli.sign("vault:tenant42/release-signer/v1",
+                              b"payload to sign", "sha256")?;
+    println!("alg={alg} sig_len={}", sig.len());
+
+    // 3b. Whole constellation.
+    let con = Constellation::new(reg, opts);
+    let results = con.stage_pending_profile(
+        "vault:tenant42/master-kek/v1",
+        AttestationProfile {
+            name: "app:v3 / SGX".into(),
+            measurements: vec![Measurement::Mrenclave("a1b2…".into())],
+            attestation_servers: vec!["https://as.privasys.org".into()],
+            quote_freshness_max_seconds: 60,
+            ..Default::default()
+        },
+        PendingProfileSource::PlatformBuild,
+    )?;
+    for r in &results {
+        println!("{}: ok={} err={:?} pending_id={:?}",
+                 r.vault.host(), r.success, r.err, r.pending_id);
+    }
+    Ok(())
+}
 ```
 
-## Dependencies
+## Shamir helper (legacy `RawShare` keys)
 
-| Language | Dependency | Purpose |
-|----------|-----------|---------|
-| Go | [`ra-tls-clients/go/ratls`](https://github.com/Privasys/ra-tls-clients) | RA-TLS transport (Connect, SendData, VerifyCertificate) |
-| Rust | [`ratls-client`](https://github.com/Privasys/ra-tls-clients) | RA-TLS transport crate |
+The `RawShare` key type stores Shamir shares of an external secret (the original v0.1 use case — sealing an app's KV master key behind k-of-n SGX enclaves). Both SDKs ship the same finite-field implementation:
 
-### Go Local Development
+- GF(2⁸) with AES's irreducible polynomial `x⁸ + x⁴ + x³ + x + 1` (`0x11b`)
+- Generator `g = 3`
+- Per-byte independent random polynomial of degree `threshold − 1`
+- Threshold ≥ 2, ≤ 255 shares total
 
-The Go module uses a `replace` directive for local development:
+Helpers: `vault.SplitShares(secret, threshold, n)` / `vault.CombineShares(shares)` (Go) and `enclave_vaults_client::shamir::{split, combine}` (Rust). Tests: `cd go && go test ./vault/ -v` and `cd rust && cargo test`.
 
-```
-replace enclave-os-mini/clients/go => ../../../ra-tls-clients/go
-```
+## Trust model in one sentence
 
-Update this path to match your workspace layout, or replace with a tagged version for CI:
+> The SDK trusts only attested vault enclaves it has handshaken with itself; it never trusts the registry for anything beyond endpoint discovery, and approval tokens travel SDK → vault end-to-end without ever transiting the registry.
 
-```
-require github.com/Privasys/ra-tls-clients/go v0.2.0
-```
+## Related
 
-## Running Tests
-
-### Go (Shamir tests)
-
-```bash
-cd go
-go test ./vault/ -v
-```
-
-### Rust (Shamir tests)
-
-```bash
-cd rust
-cargo test
-```
-
-## Related Projects
-
-| Project | Description |
-|---------|-------------|
-| [enclave-vaults](https://github.com/Privasys/enclave-vaults) | Attested Registry + Vault deployment |
-| [enclave-os-mini](https://github.com/Privasys/enclave-os-mini) | SGX enclave runtime (Rust) |
-| [enclave-os-virtual](https://github.com/Privasys/enclave-os-virtual) | TDX/SEV-SNP confidential VM runtime (Go) |
-| [ra-tls-clients](https://github.com/Privasys/ra-tls-clients) | RA-TLS client libraries |
+| Project                                                                          | Description                                                                                |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| [enclave-vaults](https://github.com/Privasys/enclave-vaults)                     | Vault enclave composition + Attested Registry                                              |
+| [enclave-os-mini](https://github.com/Privasys/enclave-os-mini)                   | SGX runtime; ships the `enclave-os-vault` module                                           |
+| [ra-tls-clients](https://github.com/Privasys/ra-tls-clients)                     | RA-TLS client transport (Go + Rust); used by this SDK                                      |
+| [Privasys ID](https://privasys.id)                                               | Default OIDC IdP                                                                           |
 
 ## License
 
-This project is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+[GNU Affero General Public License v3.0](LICENSE).
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+See [SECURITY.md](SECURITY.md) for vulnerability reporting.
