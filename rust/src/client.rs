@@ -173,6 +173,8 @@ pub enum Operation {
     Sign,
     Mac,
     PromoteProfile,
+    /// Fill a two-phase-created key (vault-v0.20.x+).
+    ProvideMaterial,
 }
 
 /// Top-level policy field whose mutability can be granted / forbidden.
@@ -411,9 +413,16 @@ enum VaultRequest<'a> {
     CreateKey {
         handle: &'a str,
         key_type: KeyType,
-        material_b64: String,
+        /// `None` = two-phase create (reserve handle + policy only).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        material_b64: Option<String>,
         exportable: bool,
         policy: &'a KeyPolicy,
+    },
+    ProvideMaterial {
+        handle: &'a str,
+        material_b64: String,
+        approvals: &'a [ApprovalToken],
     },
     ExportKey {
         handle: &'a str,
@@ -495,6 +504,12 @@ enum VaultRequest<'a> {
 #[allow(dead_code)] // serde reads every field; not all are exposed by the SDK API
 enum VaultResponse {
     KeyCreated {
+        handle: String,
+        expires_at: u64,
+        #[serde(default)]
+        pending_material: bool,
+    },
+    MaterialProvided {
         handle: String,
         expires_at: u64,
     },
@@ -725,12 +740,60 @@ impl Client {
         let resp = self.call(&VaultRequest::CreateKey {
             handle,
             key_type,
-            material_b64: URL_SAFE_NO_PAD.encode(material),
+            material_b64: Some(URL_SAFE_NO_PAD.encode(material)),
             exportable,
             policy,
         })?;
         match resp {
             VaultResponse::KeyCreated { expires_at, .. } => Ok(expires_at),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Reserve a handle + policy with no material (two-phase create,
+    /// vault-v0.20.x+). The policy must carry an `OperationRule` granting
+    /// [`Operation::ProvideMaterial`], or the vault rejects the create.
+    /// Returns the expiry (unix seconds): an unfilled key dies on its TTL.
+    pub fn create_key_pending(
+        &self,
+        handle: &str,
+        key_type: KeyType,
+        exportable: bool,
+        policy: &KeyPolicy,
+    ) -> Result<u64> {
+        let resp = self.call(&VaultRequest::CreateKey {
+            handle,
+            key_type,
+            material_b64: None,
+            exportable,
+            policy,
+        })?;
+        match resp {
+            VaultResponse::KeyCreated {
+                expires_at,
+                pending_material: true,
+                ..
+            } => Ok(expires_at),
+            VaultResponse::KeyCreated { .. } => Err(Error::UnexpectedResponse),
+            _ => Err(Error::UnexpectedResponse),
+        }
+    }
+
+    /// Fill a two-phase-created key. One-shot: the vault rejects it once
+    /// the key has material.
+    pub fn provide_material(
+        &self,
+        handle: &str,
+        material: &[u8],
+        approvals: &[ApprovalToken],
+    ) -> Result<u64> {
+        let resp = self.call(&VaultRequest::ProvideMaterial {
+            handle,
+            material_b64: URL_SAFE_NO_PAD.encode(material),
+            approvals,
+        })?;
+        match resp {
+            VaultResponse::MaterialProvided { expires_at, .. } => Ok(expires_at),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -1102,5 +1165,59 @@ impl Constellation {
             c.revoke_pending_profile(handle, pending_id)
                 .map(|()| EndpointPayload::Empty)
         })
+    }
+
+    /// Reserve the same handle + policy on every live vault with no
+    /// material (two-phase create). Partial failures are surfaced
+    /// verbatim; re-drive on the vaults that did not ack.
+    pub fn create_key_pending(
+        &self,
+        handle: &str,
+        key_type: KeyType,
+        exportable: bool,
+        policy: &KeyPolicy,
+    ) -> Result<Vec<EndpointResult>> {
+        self.for_each(|c| {
+            c.create_key_pending(handle, key_type, exportable, policy)
+                .map(|_| EndpointPayload::Empty)
+        })
+    }
+
+    /// Shamir-split `secret` across all live vaults and fill each vault's
+    /// pending key with its own share (one share per vault, k-of-n
+    /// reconstruction). Intended to run inside the TEE that generated the
+    /// secret: the whole secret never leaves the caller.
+    ///
+    /// `ProvideMaterial` is one-shot per vault, so on partial failure
+    /// re-drive only the vaults that did not ack with the SAME per-vault
+    /// share (returned alongside the results, in vault order). The caller
+    /// decides whether `threshold` acks are enough.
+    pub fn provide_material_shares(
+        &self,
+        handle: &str,
+        secret: &[u8],
+        threshold: usize,
+        approvals: &[ApprovalToken],
+    ) -> Result<(Vec<EndpointResult>, Vec<Vec<u8>>)> {
+        let vaults = self.registry.list_vaults()?;
+        if vaults.is_empty() {
+            return Err(Error::Registry("no vaults registered".into()));
+        }
+        let shares = crate::shamir::split(secret, threshold, vaults.len())
+            .map_err(|e| Error::Codec(format!("shamir split: {e}")))?;
+        let share_bytes: Vec<Vec<u8>> = shares.iter().map(|s| s.to_bytes()).collect();
+
+        let mut out = Vec::with_capacity(vaults.len());
+        for (v, share) in vaults.into_iter().zip(share_bytes.iter()) {
+            let opts = (self.dial)();
+            let res = match Client::dial(v.clone(), opts) {
+                Ok(c) => c
+                    .provide_material(handle, share, approvals)
+                    .map(|_| EndpointPayload::Empty),
+                Err(e) => Err(e),
+            };
+            out.push(EndpointResult { vault: v, result: res });
+        }
+        Ok((out, share_bytes))
     }
 }

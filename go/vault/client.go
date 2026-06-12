@@ -174,6 +174,8 @@ const (
 	OpSign           Operation = "Sign"
 	OpMac            Operation = "Mac"
 	OpPromoteProfile Operation = "PromoteProfile"
+	// OpProvideMaterial fills a two-phase-created key (vault-v0.20.x+).
+	OpProvideMaterial Operation = "ProvideMaterial"
 )
 
 // PolicyField identifies a top-level policy field that mutability rules
@@ -444,6 +446,7 @@ type AuditEntry struct {
 
 type vaultRequest struct {
 	CreateKey             *createKeyReq             `json:"CreateKey,omitempty"`
+	ProvideMaterial       *provideMaterialReq       `json:"ProvideMaterial,omitempty"`
 	ExportKey             *handleApprovalsReq       `json:"ExportKey,omitempty"`
 	DeleteKey             *handleApprovalsReq       `json:"DeleteKey,omitempty"`
 	UpdatePolicy          *updatePolicyReq          `json:"UpdatePolicy,omitempty"`
@@ -473,11 +476,18 @@ func (vr vaultRequest) MarshalJSON() ([]byte, error) {
 }
 
 type createKeyReq struct {
-	Handle      string    `json:"handle"`
-	KeyType     KeyType   `json:"key_type"`
-	MaterialB64 string    `json:"material_b64"`
+	Handle  string  `json:"handle"`
+	KeyType KeyType `json:"key_type"`
+	// nil = two-phase create (reserve handle + policy, material later).
+	MaterialB64 *string   `json:"material_b64,omitempty"`
 	Exportable  bool      `json:"exportable"`
 	Policy      KeyPolicy `json:"policy"`
+}
+
+type provideMaterialReq struct {
+	Handle      string          `json:"handle"`
+	MaterialB64 string          `json:"material_b64"`
+	Approvals   []ApprovalToken `json:"approvals,omitempty"`
 }
 
 type handleReq struct {
@@ -552,9 +562,14 @@ type revokePendingProfileReq struct {
 // pre-process those in unmarshalResponse to turn them into objects.
 type vaultResponse struct {
 	KeyCreated *struct {
+		Handle          string `json:"handle"`
+		ExpiresAt       uint64 `json:"expires_at"`
+		PendingMaterial bool   `json:"pending_material"`
+	} `json:"KeyCreated,omitempty"`
+	MaterialProvided *struct {
 		Handle    string `json:"handle"`
 		ExpiresAt uint64 `json:"expires_at"`
-	} `json:"KeyCreated,omitempty"`
+	} `json:"MaterialProvided,omitempty"`
 	KeyMaterial *struct {
 		Material  []byte `json:"material"`
 		ExpiresAt uint64 `json:"expires_at"`
@@ -786,10 +801,11 @@ func truncate(b []byte, n int) string {
 // seconds) on success.
 func (c *Client) CreateKey(ctx context.Context, handle string, keyType KeyType,
 	material []byte, exportable bool, policy KeyPolicy) (uint64, error) {
+	b64 := base64.RawURLEncoding.EncodeToString(material)
 	resp, err := c.call(ctx, vaultRequest{CreateKey: &createKeyReq{
 		Handle:      handle,
 		KeyType:     keyType,
-		MaterialB64: base64.RawURLEncoding.EncodeToString(material),
+		MaterialB64: &b64,
 		Exportable:  exportable,
 		Policy:      policy,
 	}})
@@ -800,6 +816,49 @@ func (c *Client) CreateKey(ctx context.Context, handle string, keyType KeyType,
 		return 0, ErrUnexpectedResponse
 	}
 	return resp.KeyCreated.ExpiresAt, nil
+}
+
+// CreateKeyPending reserves a handle + policy with no material (two-phase
+// create, vault-v0.20.x+). The policy must carry an OperationRule granting
+// OpProvideMaterial, or the vault rejects the create. Whoever that rule
+// names fills the key later via ProvideMaterial; until then every key
+// operation is denied and the key expires on its normal TTL.
+func (c *Client) CreateKeyPending(ctx context.Context, handle string, keyType KeyType,
+	exportable bool, policy KeyPolicy) (uint64, error) {
+	resp, err := c.call(ctx, vaultRequest{CreateKey: &createKeyReq{
+		Handle:     handle,
+		KeyType:    keyType,
+		Exportable: exportable,
+		Policy:     policy,
+	}})
+	if err != nil {
+		return 0, err
+	}
+	if resp.KeyCreated == nil {
+		return 0, ErrUnexpectedResponse
+	}
+	if !resp.KeyCreated.PendingMaterial {
+		return 0, fmt.Errorf("vault did not mark the key pending (pre-v0.20 vault?)")
+	}
+	return resp.KeyCreated.ExpiresAt, nil
+}
+
+// ProvideMaterial fills a two-phase-created key. One-shot: the vault
+// rejects it once the key has material.
+func (c *Client) ProvideMaterial(ctx context.Context, handle string,
+	material []byte, approvals ...ApprovalToken) (uint64, error) {
+	resp, err := c.call(ctx, vaultRequest{ProvideMaterial: &provideMaterialReq{
+		Handle:      handle,
+		MaterialB64: base64.RawURLEncoding.EncodeToString(material),
+		Approvals:   approvals,
+	}})
+	if err != nil {
+		return 0, err
+	}
+	if resp.MaterialProvided == nil {
+		return 0, ErrUnexpectedResponse
+	}
+	return resp.MaterialProvided.ExpiresAt, nil
 }
 
 // ExportKey returns the raw key material (only allowed when exportable
@@ -1149,4 +1208,58 @@ func (con *Constellation) RevokePendingProfile(ctx context.Context, handle strin
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
 		return EndpointResult{}, c.RevokePendingProfile(ctx, handle, pendingID)
 	})
+}
+
+// CreateKeyPending reserves the same handle + policy on every live vault
+// with no material (two-phase create). Partial failures are surfaced
+// verbatim; fix forward by re-driving the create on vaults that did not
+// ack (the vault rejects duplicate handles, so re-driving is idempotent
+// in effect).
+func (con *Constellation) CreateKeyPending(ctx context.Context, handle string,
+	keyType KeyType, exportable bool, policy KeyPolicy) ([]EndpointResult, error) {
+	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
+		_, err := c.CreateKeyPending(ctx, handle, keyType, exportable, policy)
+		return EndpointResult{}, err
+	})
+}
+
+// ProvideMaterialShares Shamir-splits secret across all live vaults and
+// fills each vault's pending key with its own share (one share per vault,
+// k-of-n reconstruction). Intended to run inside the TEE that generated
+// the secret: the whole secret never leaves the caller.
+//
+// Unlike forEach operations this is NOT re-drivable as-is: ProvideMaterial
+// is one-shot per vault, so on partial failure re-drive only the vaults
+// that did not ack, reusing the SAME per-vault share (returned in
+// EndpointResult order). The caller decides whether k acks are enough.
+func (con *Constellation) ProvideMaterialShares(ctx context.Context, handle string,
+	secret []byte, threshold int, approvals ...ApprovalToken) ([]EndpointResult, [][]byte, error) {
+	vaults, err := con.Registry.ListVaults(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("registry: %w", err)
+	}
+	if len(vaults) == 0 {
+		return nil, nil, errors.New("registry returned no vaults")
+	}
+	shares, err := ShamirSplit(secret, threshold, len(vaults))
+	if err != nil {
+		return nil, nil, fmt.Errorf("shamir split: %w", err)
+	}
+	shareBytes := make([][]byte, len(shares))
+	for i, s := range shares {
+		shareBytes[i] = ShareToBytes(s)
+	}
+
+	out := make([]EndpointResult, len(vaults))
+	for i, v := range vaults {
+		c, err := Dial(ctx, v, con.Dial)
+		if err != nil {
+			out[i] = EndpointResult{Vault: v, Err: err}
+			continue
+		}
+		_, err = c.ProvideMaterial(ctx, handle, shareBytes[i], approvals...)
+		c.Close()
+		out[i] = EndpointResult{Vault: v, Success: err == nil, Err: err}
+	}
+	return out, shareBytes, nil
 }
