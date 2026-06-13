@@ -1129,12 +1129,18 @@ type EndpointResult struct {
 	Pending       []PendingProfile
 }
 
-// Constellation discovers vaults via the registry and fans operations
-// out to all of them. Used for cross-vault operations like staging a new
-// attestation profile during an enclave upgrade.
+// Constellation fans operations out to every vault in the constellation.
+// Vaults come either from a fixed endpoint list (Static) or from a
+// registry phonebook. Trust never comes from either source: the SDK
+// verifies each vault's attestation quote itself at Dial time.
 type Constellation struct {
 	Registry *RegistryClient
-	Dial     DialOptions
+	// Static is a fixed endpoint list; when non-empty it takes precedence
+	// over Registry. The 2-of-4 production constellation is addressed this
+	// way (the registry is decommissioned; vault inventory will later move
+	// into the platform API, fleet-style).
+	Static []VaultRegistration
+	Dial   DialOptions
 }
 
 // NewConstellation returns a Constellation backed by the given registry.
@@ -1142,16 +1148,41 @@ func NewConstellation(reg *RegistryClient, dialOpts DialOptions) *Constellation 
 	return &Constellation{Registry: reg, Dial: dialOpts}
 }
 
-// forEach connects to each live vault and applies fn. Connections are
-// closed before the function returns.
-func (con *Constellation) forEach(ctx context.Context,
-	fn func(*Client) (EndpointResult, error)) ([]EndpointResult, error) {
+// NewStaticConstellation returns a Constellation backed by a fixed
+// endpoint list ("host:port" each), no registry involved.
+func NewStaticConstellation(endpoints []string, dialOpts DialOptions) *Constellation {
+	vaults := make([]VaultRegistration, len(endpoints))
+	for i, e := range endpoints {
+		vaults[i] = VaultRegistration{ID: e, Endpoint: e, Status: "static"}
+	}
+	return &Constellation{Static: vaults, Dial: dialOpts}
+}
+
+// listVaults resolves the constellation membership.
+func (con *Constellation) listVaults(ctx context.Context) ([]VaultRegistration, error) {
+	if len(con.Static) > 0 {
+		return con.Static, nil
+	}
+	if con.Registry == nil {
+		return nil, errors.New("constellation has neither static endpoints nor a registry")
+	}
 	vaults, err := con.Registry.ListVaults(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("registry: %w", err)
 	}
+	return vaults, nil
+}
+
+// forEach connects to each live vault and applies fn. Connections are
+// closed before the function returns.
+func (con *Constellation) forEach(ctx context.Context,
+	fn func(*Client) (EndpointResult, error)) ([]EndpointResult, error) {
+	vaults, err := con.listVaults(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if len(vaults) == 0 {
-		return nil, errors.New("registry returned no vaults")
+		return nil, errors.New("constellation has no vaults")
 	}
 	out := make([]EndpointResult, len(vaults))
 	for i, v := range vaults {
@@ -1234,12 +1265,12 @@ func (con *Constellation) CreateKeyPending(ctx context.Context, handle string,
 // EndpointResult order). The caller decides whether k acks are enough.
 func (con *Constellation) ProvideMaterialShares(ctx context.Context, handle string,
 	secret []byte, threshold int, approvals ...ApprovalToken) ([]EndpointResult, [][]byte, error) {
-	vaults, err := con.Registry.ListVaults(ctx)
+	vaults, err := con.listVaults(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("registry: %w", err)
+		return nil, nil, err
 	}
 	if len(vaults) == 0 {
-		return nil, nil, errors.New("registry returned no vaults")
+		return nil, nil, errors.New("constellation has no vaults")
 	}
 	shares, err := ShamirSplit(secret, threshold, len(vaults))
 	if err != nil {

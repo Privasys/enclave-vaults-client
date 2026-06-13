@@ -1077,30 +1077,74 @@ pub enum EndpointPayload {
     Empty,
 }
 
+/// Where a [`Constellation`] gets its membership from. Trust never comes
+/// from either source: the SDK verifies each vault's attestation quote
+/// itself at dial time.
+pub enum VaultSource {
+    /// Registry phonebook (decommissioned in the current deployment;
+    /// vault inventory will later move into the platform API,
+    /// fleet-style).
+    Registry(RegistryClient),
+    /// Fixed endpoint list — how the 2-of-4 production constellation is
+    /// addressed today.
+    Static(Vec<VaultRegistration>),
+}
+
 /// Fan-out helper for cross-vault operations.
 ///
 /// Each call to a `Constellation` method:
 ///
-///  1. Lists vaults from the registry.
+///  1. Resolves the vault list (static endpoints or registry).
 ///  2. Dials each one in turn (sequentially, dropping the connection
 ///     before moving on).
 ///  3. Returns one [`EndpointResult`] per vault.
 pub struct Constellation {
-    pub registry: RegistryClient,
+    pub source: VaultSource,
     /// Builder closure invoked once per vault to produce a fresh
     /// [`DialOptions`]. Required because [`AuthTokenSource`] is not `Clone`.
     pub dial: Box<dyn Fn() -> DialOptions + Send + Sync>,
 }
 
 impl Constellation {
-    /// Construct a `Constellation`.
+    /// Construct a `Constellation` backed by a registry phonebook.
     pub fn new(
         registry: RegistryClient,
         dial: impl Fn() -> DialOptions + Send + Sync + 'static,
     ) -> Self {
         Self {
-            registry,
+            source: VaultSource::Registry(registry),
             dial: Box::new(dial),
+        }
+    }
+
+    /// Construct a `Constellation` from a fixed endpoint list
+    /// (`"host:port"` each), no registry involved.
+    pub fn with_endpoints(
+        endpoints: &[&str],
+        dial: impl Fn() -> DialOptions + Send + Sync + 'static,
+    ) -> Self {
+        let vaults = endpoints
+            .iter()
+            .map(|e| VaultRegistration {
+                id: (*e).to_string(),
+                endpoint: (*e).to_string(),
+                mrenclave: String::new(),
+                mrsigner: String::new(),
+                registered_at: String::new(),
+                last_heartbeat: String::new(),
+                status: "static".to_string(),
+            })
+            .collect();
+        Self {
+            source: VaultSource::Static(vaults),
+            dial: Box::new(dial),
+        }
+    }
+
+    fn list_vaults(&self) -> Result<Vec<VaultRegistration>> {
+        match &self.source {
+            VaultSource::Registry(reg) => reg.list_vaults(),
+            VaultSource::Static(vaults) => Ok(vaults.clone()),
         }
     }
 
@@ -1108,9 +1152,9 @@ impl Constellation {
     where
         F: FnMut(&Client) -> Result<EndpointPayload>,
     {
-        let vaults = self.registry.list_vaults()?;
+        let vaults = self.list_vaults()?;
         if vaults.is_empty() {
-            return Err(Error::Registry("no vaults registered".into()));
+            return Err(Error::Registry("constellation has no vaults".into()));
         }
         let mut out = Vec::with_capacity(vaults.len());
         for v in vaults {
@@ -1199,9 +1243,9 @@ impl Constellation {
         threshold: usize,
         approvals: &[ApprovalToken],
     ) -> Result<(Vec<EndpointResult>, Vec<Vec<u8>>)> {
-        let vaults = self.registry.list_vaults()?;
+        let vaults = self.list_vaults()?;
         if vaults.is_empty() {
-            return Err(Error::Registry("no vaults registered".into()));
+            return Err(Error::Registry("constellation has no vaults".into()));
         }
         let shares = crate::shamir::split(secret, threshold, vaults.len())
             .map_err(|e| Error::Codec(format!("shamir split: {e}")))?;
