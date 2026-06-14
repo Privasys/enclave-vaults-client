@@ -688,6 +688,18 @@ type DialOptions struct {
 	// generation that binds the server's challenge nonce. Takes
 	// precedence over ClientCert when both are set.
 	GetClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+
+	// Challenge is a per-connection nonce sent in the TLS ClientHello
+	// (RA-TLS extension 0xFFBB). It serves two purposes: (1) the vault
+	// binds it into the ReportData of a freshly generated server cert, so
+	// the client can verify the vault's quote via challenge-response
+	// (VaultPolicy.ReportData = ReportDataChallengeResponse, Nonce =
+	// Challenge) rather than relying on a deterministic binding; and (2) it
+	// puts the vault into bidirectional-challenge mode, in which it issues
+	// its own challenge in the TLS CertificateRequest — required for the
+	// vault to accept a challenge-bound Tee client certificate. Nil for
+	// plain owner-authenticated calls that present no client cert.
+	Challenge []byte
 }
 
 // Client is an authenticated session against a single vault instance.
@@ -728,6 +740,7 @@ func (c *Client) reconnect(ctx context.Context) error {
 		CACertPath:           c.opts.CACertPath,
 		ClientCert:           c.opts.ClientCert,
 		GetClientCertificate: c.opts.GetClientCertificate,
+		Challenge:            c.opts.Challenge,
 	})
 	if err != nil {
 		return fmt.Errorf("vault %s: ratls dial: %w", c.registration.Endpoint, err)
