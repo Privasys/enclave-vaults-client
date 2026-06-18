@@ -361,7 +361,7 @@ type Condition struct {
 }
 
 // OidcStepUpCond requires the caller's OIDC bearer to prove a fresh WebAuthn
-// step-up bound to this operation (the vault promote step-up; policies-plan.md
+// step-up bound to this operation (the vault promote step-up; the MR_APP / promote-step-up design
 // §9). The token's amr must contain every method in RequiredAmr, its iat must be
 // within FreshForSeconds, and when OperationBound the token's vault_op must bind
 // (handle, promoted measurement, policy_version, nonce, exp).
