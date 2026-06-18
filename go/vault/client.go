@@ -352,10 +352,23 @@ func RefTee(i uint32) PrincipalRef     { return PrincipalRef{Tee: &i} }
 //	{"AttestationMatches": <AttestationProfile>}
 //	{"ManagerApproval":    {"manager": u32, "fresh_for_seconds": u64}}
 //	{"TimeWindow":         {"not_before": u64, "not_after": u64}}
+//	{"OidcStepUp":         {"required_amr": [...], "operation_bound": bool, "fresh_for_seconds": u64}}
 type Condition struct {
 	AttestationMatches *AttestationProfile  `json:"AttestationMatches,omitempty"`
 	ManagerApproval    *ManagerApprovalCond `json:"ManagerApproval,omitempty"`
 	TimeWindow         *TimeWindowCond      `json:"TimeWindow,omitempty"`
+	OidcStepUp         *OidcStepUpCond      `json:"OidcStepUp,omitempty"`
+}
+
+// OidcStepUpCond requires the caller's OIDC bearer to prove a fresh WebAuthn
+// step-up bound to this operation (the vault promote step-up; policies-plan.md
+// §9). The token's amr must contain every method in RequiredAmr, its iat must be
+// within FreshForSeconds, and when OperationBound the token's vault_op must bind
+// (handle, promoted measurement, policy_version, nonce, exp).
+type OidcStepUpCond struct {
+	RequiredAmr     []string `json:"required_amr,omitempty"`
+	OperationBound  bool     `json:"operation_bound,omitempty"`
+	FreshForSeconds uint64   `json:"fresh_for_seconds,omitempty"`
 }
 
 // ManagerApprovalCond requires a fresh approval token from a manager.
