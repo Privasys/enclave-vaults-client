@@ -1267,6 +1267,18 @@ func (con *Constellation) RevokePendingProfile(ctx context.Context, handle strin
 	})
 }
 
+// DeleteKey fans DeleteKey out to every live vault, carrying any approval
+// tokens to each. Used to retire a superseded key generation (e.g. the old
+// storage-kek/v(N) after a KEK rotation has re-keyed the volume to v(N+1)).
+// Partial failures are surfaced verbatim; re-driving is idempotent (a vault
+// that no longer holds the handle simply reports it gone).
+func (con *Constellation) DeleteKey(ctx context.Context, handle string,
+	approvals ...ApprovalToken) ([]EndpointResult, error) {
+	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
+		return EndpointResult{}, c.DeleteKey(ctx, handle, approvals...)
+	})
+}
+
 // CreateKeyPending reserves the same handle + policy on every live vault
 // with no material (two-phase create). Partial failures are surfaced
 // verbatim; fix forward by re-driving the create on vaults that did not
