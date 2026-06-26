@@ -11,13 +11,13 @@ package vault
 //
 // Three layers of API:
 //
-//  1. Registry discovery â€” query the Attested Registry phonebook to find
+//  1. Registry discovery — query the Attested Registry phonebook to find
 //     live vault instances:
 //
 //         reg := NewRegistryClient("https://u.registry.vaults.privasys.org")
 //         vaults, _ := reg.ListVaults(ctx)
 //
-//  2. Single-vault key operations â€” connect to one vault over RA-TLS and
+//  2. Single-vault key operations — connect to one vault over RA-TLS and
 //     issue HSM-shaped requests (CreateKey / Wrap / Sign / etc.):
 //
 //         c, _ := Dial(ctx, vaults[0], DialOptions{
@@ -26,18 +26,18 @@ package vault
 //             GetClientCertificate: ratlsClientCert,
 //         })
 //         defer c.Close()
-//         _, err := c.CreateKey(ctx, "my-aes-key", Aes256GcmKey, keyBytes,
-//             false, KeyPolicy{...})
+//         _, err := c.CreateKey(ctx, "my-aes-key", keyBytes, grant)
 //
-//  3. Constellation fan-out â€” for operations that must succeed on every
+//  3. Constellation fan-out — for operations that must succeed on every
 //     vault holding the same logical key (in particular: pending
 //     attestation profiles for an enclave upgrade):
 //
 //         con := NewConstellation(reg, dialOpts)
 //         results, _ := con.StagePendingProfile(ctx, "my-key", profile, PlatformBuild)
 //
-// Shamir Secret Sharing helpers (shamir.go) are unchanged and used to
-// split a secret into RawShare key material before CreateKey.
+// Shamir Secret Sharing helpers (shamir.go) split a secret into per-vault
+// shares; Constellation.CreateKeyShares uses them to create one key across
+// the constellation with a share as each vault's material.
 
 import (
 	"context"
@@ -145,7 +145,7 @@ func (rc *RegistryClient) ListVaults(ctx context.Context) ([]VaultRegistration, 
 }
 
 // ===========================================================================
-//  Wire types â€” VaultRequest / VaultResponse
+//  Wire types — VaultRequest / VaultResponse
 //
 //  Mirror enclave-os-mini/crates/enclave-os-vault/src/types.rs.
 //  Each VaultRequest is JSON-encoded as a single-key object whose key is
@@ -174,8 +174,6 @@ const (
 	OpSign           Operation = "Sign"
 	OpMac            Operation = "Mac"
 	OpPromoteProfile Operation = "PromoteProfile"
-	// OpProvideMaterial fills a two-phase-created key (vault-v0.20.x+).
-	OpProvideMaterial Operation = "ProvideMaterial"
 )
 
 // PolicyField identifies a top-level policy field that mutability rules
@@ -232,7 +230,7 @@ type OidcPrincipal struct {
 }
 
 // Fido2Principal authenticates via a previously-registered FIDO2
-// credential. Reserved â€” not yet honoured by the vault.
+// credential. Reserved — not yet honoured by the vault.
 type Fido2Principal struct {
 	RpID            string `json:"rp_id"`
 	CredentialIDB64 string `json:"credential_id_b64"`
@@ -459,7 +457,6 @@ type AuditEntry struct {
 
 type vaultRequest struct {
 	CreateKey             *createKeyReq             `json:"CreateKey,omitempty"`
-	ProvideMaterial       *provideMaterialReq       `json:"ProvideMaterial,omitempty"`
 	ExportKey             *handleApprovalsReq       `json:"ExportKey,omitempty"`
 	DeleteKey             *handleApprovalsReq       `json:"DeleteKey,omitempty"`
 	UpdatePolicy          *updatePolicyReq          `json:"UpdatePolicy,omitempty"`
@@ -478,7 +475,7 @@ type vaultRequest struct {
 	RevokePendingProfile  *revokePendingProfileReq  `json:"RevokePendingProfile,omitempty"`
 }
 
-// MarshalJSON: ListKeys is a unit variant â€” encode as the bare string
+// MarshalJSON: ListKeys is a unit variant — encode as the bare string
 // "ListKeys", matching serde's default for unit enum variants.
 func (vr vaultRequest) MarshalJSON() ([]byte, error) {
 	if vr.ListKeys {
@@ -489,18 +486,13 @@ func (vr vaultRequest) MarshalJSON() ([]byte, error) {
 }
 
 type createKeyReq struct {
-	Handle  string  `json:"handle"`
-	KeyType KeyType `json:"key_type"`
-	// nil = two-phase create (reserve handle + policy, material later).
-	MaterialB64 *string   `json:"material_b64,omitempty"`
-	Exportable  bool      `json:"exportable"`
-	Policy      KeyPolicy `json:"policy"`
-}
-
-type provideMaterialReq struct {
-	Handle      string          `json:"handle"`
-	MaterialB64 string          `json:"material_b64"`
-	Approvals   []ApprovalToken `json:"approvals,omitempty"`
+	Handle string `json:"handle"`
+	// Base64url-encoded raw key material (this vault's share for a
+	// constellation create).
+	MaterialB64 string `json:"material_b64"`
+	// IdP-issued key-creation grant (JWT) carrying owner, scope, key type,
+	// exportable flag and policy.
+	Grant string `json:"grant"`
 }
 
 type handleReq struct {
@@ -575,14 +567,9 @@ type revokePendingProfileReq struct {
 // pre-process those in unmarshalResponse to turn them into objects.
 type vaultResponse struct {
 	KeyCreated *struct {
-		Handle          string `json:"handle"`
-		ExpiresAt       uint64 `json:"expires_at"`
-		PendingMaterial bool   `json:"pending_material"`
-	} `json:"KeyCreated,omitempty"`
-	MaterialProvided *struct {
 		Handle    string `json:"handle"`
 		ExpiresAt uint64 `json:"expires_at"`
-	} `json:"MaterialProvided,omitempty"`
+	} `json:"KeyCreated,omitempty"`
 	KeyMaterial *struct {
 		Material  []byte `json:"material"`
 		ExpiresAt uint64 `json:"expires_at"`
@@ -688,7 +675,7 @@ type DialOptions struct {
 
 	// VaultPolicy is the RA-TLS verification policy (acceptable
 	// MRENCLAVE / MRSIGNER, attestation servers, etc.). When nil the
-	// client trusts the connection without quote verification â€” only
+	// client trusts the connection without quote verification — only
 	// safe for local development.
 	VaultPolicy *ratls.VerificationPolicy
 
@@ -823,68 +810,26 @@ func truncate(b []byte, n int) string {
 //  Per-vault operations
 // ----------------------------------------------------------------------
 
-// CreateKey stores a new key on the vault. Returns the key's expiry (unix
-// seconds) on success.
-func (c *Client) CreateKey(ctx context.Context, handle string, keyType KeyType,
-	material []byte, exportable bool, policy KeyPolicy) (uint64, error) {
-	b64 := base64.RawURLEncoding.EncodeToString(material)
+// CreateKey stores a new key on the vault in a single call. The caller
+// presents an IdP-issued grant carrying the owner, scope, key type,
+// exportable flag and policy; the vault binds it to the caller's attested
+// app-id (OID 3.6) or holder-of-key cnf. material is this vault's raw key
+// material (a share, for a constellation create). Returns the key's expiry
+// (unix seconds) on success.
+func (c *Client) CreateKey(ctx context.Context, handle string,
+	material []byte, grant string) (uint64, error) {
 	resp, err := c.call(ctx, vaultRequest{CreateKey: &createKeyReq{
-		Handle:      handle,
-		KeyType:     keyType,
-		MaterialB64: &b64,
-		Exportable:  exportable,
-		Policy:      policy,
-	}})
-	if err != nil {
-		return 0, err
-	}
-	if resp.KeyCreated == nil {
-		return 0, ErrUnexpectedResponse
-	}
-	return resp.KeyCreated.ExpiresAt, nil
-}
-
-// CreateKeyPending reserves a handle + policy with no material (two-phase
-// create, vault-v0.20.x+). The policy must carry an OperationRule granting
-// OpProvideMaterial, or the vault rejects the create. Whoever that rule
-// names fills the key later via ProvideMaterial; until then every key
-// operation is denied and the key expires on its normal TTL.
-func (c *Client) CreateKeyPending(ctx context.Context, handle string, keyType KeyType,
-	exportable bool, policy KeyPolicy) (uint64, error) {
-	resp, err := c.call(ctx, vaultRequest{CreateKey: &createKeyReq{
-		Handle:     handle,
-		KeyType:    keyType,
-		Exportable: exportable,
-		Policy:     policy,
-	}})
-	if err != nil {
-		return 0, err
-	}
-	if resp.KeyCreated == nil {
-		return 0, ErrUnexpectedResponse
-	}
-	if !resp.KeyCreated.PendingMaterial {
-		return 0, fmt.Errorf("vault did not mark the key pending (pre-v0.20 vault?)")
-	}
-	return resp.KeyCreated.ExpiresAt, nil
-}
-
-// ProvideMaterial fills a two-phase-created key. One-shot: the vault
-// rejects it once the key has material.
-func (c *Client) ProvideMaterial(ctx context.Context, handle string,
-	material []byte, approvals ...ApprovalToken) (uint64, error) {
-	resp, err := c.call(ctx, vaultRequest{ProvideMaterial: &provideMaterialReq{
 		Handle:      handle,
 		MaterialB64: base64.RawURLEncoding.EncodeToString(material),
-		Approvals:   approvals,
+		Grant:       grant,
 	}})
 	if err != nil {
 		return 0, err
 	}
-	if resp.MaterialProvided == nil {
+	if resp.KeyCreated == nil {
 		return 0, ErrUnexpectedResponse
 	}
-	return resp.MaterialProvided.ExpiresAt, nil
+	return resp.KeyCreated.ExpiresAt, nil
 }
 
 // ExportKey returns the raw key material (only allowed when exportable
@@ -1139,7 +1084,7 @@ func (c *Client) RevokePendingProfile(ctx context.Context, handle string,
 }
 
 // ===========================================================================
-//  Constellation â€” fan-out across all live vaults
+//  Constellation — fan-out across all live vaults
 // ===========================================================================
 
 // EndpointResult is the outcome of one fan-out operation against one vault.
@@ -1279,30 +1224,19 @@ func (con *Constellation) DeleteKey(ctx context.Context, handle string,
 	})
 }
 
-// CreateKeyPending reserves the same handle + policy on every live vault
-// with no material (two-phase create). Partial failures are surfaced
-// verbatim; fix forward by re-driving the create on vaults that did not
-// ack (the vault rejects duplicate handles, so re-driving is idempotent
-// in effect).
-func (con *Constellation) CreateKeyPending(ctx context.Context, handle string,
-	keyType KeyType, exportable bool, policy KeyPolicy) ([]EndpointResult, error) {
-	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
-		_, err := c.CreateKeyPending(ctx, handle, keyType, exportable, policy)
-		return EndpointResult{}, err
-	})
-}
-
-// ProvideMaterialShares Shamir-splits secret across all live vaults and
-// fills each vault's pending key with its own share (one share per vault,
-// k-of-n reconstruction). Intended to run inside the TEE that generated
-// the secret: the whole secret never leaves the caller.
+// CreateKeyShares Shamir-splits secret across all live vaults and creates
+// the key on each with its own share as material (one share per vault,
+// k-of-n reconstruction), presenting the same grant to every vault.
+// Intended to run inside the TEE (or CLI agent) that generated the secret:
+// the whole secret never leaves the caller.
 //
-// Unlike forEach operations this is NOT re-drivable as-is: ProvideMaterial
-// is one-shot per vault, so on partial failure re-drive only the vaults
-// that did not ack, reusing the SAME per-vault share (returned in
-// EndpointResult order). The caller decides whether k acks are enough.
-func (con *Constellation) ProvideMaterialShares(ctx context.Context, handle string,
-	secret []byte, threshold int, approvals ...ApprovalToken) ([]EndpointResult, [][]byte, error) {
+// This is NOT re-drivable as-is: a vault rejects a duplicate handle, so on
+// partial failure re-drive only the vaults that did not ack, reusing the
+// SAME per-vault share (returned in EndpointResult order). The caller
+// decides whether k acks are enough. The shares are returned so the caller
+// can re-drive without re-splitting.
+func (con *Constellation) CreateKeyShares(ctx context.Context, handle string,
+	secret []byte, threshold int, grant string) ([]EndpointResult, [][]byte, error) {
 	vaults, err := con.listVaults(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -1326,7 +1260,7 @@ func (con *Constellation) ProvideMaterialShares(ctx context.Context, handle stri
 			out[i] = EndpointResult{Vault: v, Err: err}
 			continue
 		}
-		_, err = c.ProvideMaterial(ctx, handle, shareBytes[i], approvals...)
+		_, err = c.CreateKey(ctx, handle, shareBytes[i], grant)
 		c.Close()
 		out[i] = EndpointResult{Vault: v, Success: err == nil, Err: err}
 	}
