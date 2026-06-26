@@ -1093,11 +1093,13 @@ type EndpointResult struct {
 	Success bool
 	Err     error
 	// PendingID is set by Stage; PolicyVersion is set by Promote;
-	// Pending is set by ListPendingProfiles. All are zero/nil when not
+	// Pending is set by ListPendingProfiles; Material is set by
+	// ExportKeyShares (this vault's raw share). All are zero/nil when not
 	// applicable.
 	PendingID     uint32
 	PolicyVersion uint32
 	Pending       []PendingProfile
+	Material      []byte
 }
 
 // Constellation fans operations out to every vault in the constellation.
@@ -1265,4 +1267,49 @@ func (con *Constellation) CreateKeyShares(ctx context.Context, handle string,
 		out[i] = EndpointResult{Vault: v, Success: err == nil, Err: err}
 	}
 	return out, shareBytes, nil
+}
+
+// ExportKeyShares fans ExportKey out to every live vault, collects each
+// vault's RawShare material, and reconstructs the original secret once at
+// least `threshold` shares have been retrieved. The whole secret is
+// reassembled only in the caller's memory — no vault ever holds more than its
+// own share. The Dial OIDC bearer (and any `approvals`) must satisfy the key's
+// ExportKey policy on every vault (e.g. owner + a fresh WebAuthn step-up).
+//
+// Returns the reconstructed secret plus the per-vault results (Success marks
+// the vaults that returned a share). Errors only when fewer than `threshold`
+// vaults returned a usable share; partial vault failures are surfaced in the
+// results so the caller can report which vaults were unreachable.
+func (con *Constellation) ExportKeyShares(ctx context.Context, handle string,
+	threshold int, approvals ...ApprovalToken) ([]byte, []EndpointResult, error) {
+	if threshold < 2 {
+		return nil, nil, errors.New("threshold must be >= 2")
+	}
+	results, err := con.forEach(ctx, func(c *Client) (EndpointResult, error) {
+		material, err := c.ExportKey(ctx, handle, approvals...)
+		return EndpointResult{Material: material}, err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	var shares []*Share
+	for _, r := range results {
+		if !r.Success || len(r.Material) == 0 {
+			continue
+		}
+		s, err := ShareFromBytes(r.Material)
+		if err != nil {
+			continue
+		}
+		shares = append(shares, s)
+	}
+	if len(shares) < threshold {
+		return nil, results, fmt.Errorf("only %d of %d vaults returned a usable share (need %d)",
+			len(shares), len(results), threshold)
+	}
+	secret, err := ShamirReconstruct(shares[:threshold])
+	if err != nil {
+		return nil, results, fmt.Errorf("reconstruct: %w", err)
+	}
+	return secret, results, nil
 }
