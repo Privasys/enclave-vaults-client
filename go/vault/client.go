@@ -43,6 +43,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1308,6 +1309,56 @@ func (con *Constellation) ExportKeyShares(ctx context.Context, handle string,
 			len(shares), len(results), threshold)
 	}
 	secret, err := ShamirReconstruct(shares[:threshold])
+	if err != nil {
+		return nil, results, fmt.Errorf("reconstruct: %w", err)
+	}
+	return secret, results, nil
+}
+
+// ExportKeyGenerationShares is ExportKeyShares for keys whose per-vault material
+// is generation-prefixed — `generation(genSize bytes) || ShareToBytes(share)` —
+// the layout the enclave-os manager uses for app volume DEKs so a KEK rotation
+// can hold shares of multiple DEK generations under one handle. It strips the
+// generation prefix, groups shares by generation, and reconstructs the largest
+// same-generation group that meets threshold (mirrors the manager's decodeShare
+// + bestGroup). Returns the reconstructed secret (the DEK).
+func (con *Constellation) ExportKeyGenerationShares(ctx context.Context, handle string,
+	threshold, genSize int, approvals ...ApprovalToken) ([]byte, []EndpointResult, error) {
+	if threshold < 2 {
+		return nil, nil, errors.New("threshold must be >= 2")
+	}
+	if genSize < 1 {
+		return nil, nil, errors.New("genSize must be >= 1")
+	}
+	results, err := con.forEach(ctx, func(c *Client) (EndpointResult, error) {
+		material, err := c.ExportKey(ctx, handle, approvals...)
+		return EndpointResult{Material: material}, err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	byGen := map[string][]*Share{}
+	for _, r := range results {
+		if !r.Success || len(r.Material) < genSize+2 {
+			continue
+		}
+		gen := hex.EncodeToString(r.Material[:genSize])
+		s, serr := ShareFromBytes(r.Material[genSize:])
+		if serr != nil {
+			continue
+		}
+		byGen[gen] = append(byGen[gen], s)
+	}
+	var best []*Share
+	for _, shares := range byGen {
+		if len(shares) >= threshold && len(shares) > len(best) {
+			best = shares
+		}
+	}
+	if best == nil {
+		return nil, results, fmt.Errorf("no single-generation share group meets threshold %d (%d generation(s) seen across vaults)", threshold, len(byGen))
+	}
+	secret, err := ShamirReconstruct(best[:threshold])
 	if err != nil {
 		return nil, results, fmt.Errorf("reconstruct: %w", err)
 	}
