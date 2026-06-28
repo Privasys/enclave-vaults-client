@@ -245,10 +245,26 @@ type AttestationProfile struct {
 	RequiredOIDs       []OidRequirement    `json:"required_oids,omitempty"`
 }
 
-// Measurement is one acceptable enclave/VM measurement.
+// Measurement is one acceptable enclave/VM measurement. The wire form mirrors
+// the externally-tagged Rust enum enclave-os-vault::types::Measurement:
+//
+//	SGX: {"Mrenclave":"<hex>"}
+//	TDX: {"Tdx":{"mrtd":"<hex>","rtmr1":"<hex>","rtmr2":"<hex>"}}
+//
+// For TDX all three are pinned and must match: MRTD is the TD firmware
+// (per-platform), RTMR1/RTMR2 are the image-derived registers (EFI/UKI boot path
+// + dm-verity root) that identify the enclave-os-virtual build. MRTD alone does
+// not capture the guest image. See .operations/platform/enclave-upgrade.md.
 type Measurement struct {
-	Mrenclave string `json:"Mrenclave,omitempty"`
-	Mrtd      string `json:"Mrtd,omitempty"`
+	Mrenclave string          `json:"Mrenclave,omitempty"`
+	Tdx       *TdxMeasurement `json:"Tdx,omitempty"`
+}
+
+// TdxMeasurement is the TDX identity pinned by a policy (all hex, lowercase).
+type TdxMeasurement struct {
+	Mrtd  string `json:"mrtd"`
+	Rtmr1 string `json:"rtmr1"`
+	Rtmr2 string `json:"rtmr2"`
 }
 
 // AttestationServer pins an attestation verifier endpoint.
