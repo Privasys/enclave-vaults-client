@@ -546,6 +546,7 @@ type unwrapReq struct {
 type signOrMacReq struct {
 	Handle     string          `json:"handle"`
 	MessageB64 string          `json:"message_b64"`
+	Prehashed  bool            `json:"prehashed,omitempty"`
 	Approvals  []ApprovalToken `json:"approvals,omitempty"`
 }
 
@@ -981,6 +982,26 @@ func (c *Client) Sign(ctx context.Context, handle string, message []byte,
 	resp, err := c.call(ctx, vaultRequest{Sign: &signOrMacReq{
 		Handle:     handle,
 		MessageB64: base64.RawURLEncoding.EncodeToString(message),
+		Approvals:  approvals,
+	}})
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.Signature == nil {
+		return nil, "", ErrUnexpectedResponse
+	}
+	return resp.Signature.Signature, resp.Signature.Alg, nil
+}
+
+// SignPrehash produces an IEEE P1363 ECDSA-P256 signature over a caller-supplied
+// 32-byte SHA-256 digest, signed raw (no re-hash) — what PKCS#11 CKM_ECDSA and TLS
+// stacks send. Same key/policy (Operation::Sign) as Sign.
+func (c *Client) SignPrehash(ctx context.Context, handle string, digest []byte,
+	approvals ...ApprovalToken) ([]byte, string, error) {
+	resp, err := c.call(ctx, vaultRequest{Sign: &signOrMacReq{
+		Handle:     handle,
+		MessageB64: base64.RawURLEncoding.EncodeToString(digest),
+		Prehashed:  true,
 		Approvals:  approvals,
 	}})
 	if err != nil {
