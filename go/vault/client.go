@@ -1130,14 +1130,15 @@ type EndpointResult struct {
 	Vault   VaultRegistration
 	Success bool
 	Err     error
-	// PendingID is set by Stage; PolicyVersion is set by Promote;
+	// PendingID is set by Stage; PolicyVersion is set by Promote/UpdatePolicy;
 	// Pending is set by ListPendingProfiles; Material is set by
-	// ExportKeyShares (this vault's raw share). All are zero/nil when not
-	// applicable.
+	// ExportKeyShares (this vault's raw share); Policy is set by GetPolicy. All
+	// are zero/nil when not applicable.
 	PendingID     uint32
 	PolicyVersion uint32
 	Pending       []PendingProfile
 	Material      []byte
+	Policy        *KeyPolicy
 }
 
 // Constellation fans operations out to every vault in the constellation.
@@ -1261,6 +1262,30 @@ func (con *Constellation) DeleteKey(ctx context.Context, handle string,
 	approvals ...ApprovalToken) ([]EndpointResult, error) {
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
 		return EndpointResult{}, c.DeleteKey(ctx, handle, approvals...)
+	})
+}
+
+// GetPolicy reads the key's policy from every live vault (the policy is
+// replicated, so a caller can compare across vaults to detect divergence). Each
+// result carries the vault's Policy + PolicyVersion.
+func (con *Constellation) GetPolicy(ctx context.Context, handle string) ([]EndpointResult, error) {
+	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
+		p, ver, err := c.GetPolicy(ctx, handle)
+		if err != nil {
+			return EndpointResult{}, err
+		}
+		return EndpointResult{Policy: &p, PolicyVersion: ver}, nil
+	})
+}
+
+// UpdatePolicy fans a policy replacement out to every live vault, carrying any
+// approval tokens to each. The policy is replicated, so it must land on all
+// vaults; partial failures are surfaced verbatim per vault.
+func (con *Constellation) UpdatePolicy(ctx context.Context, handle string,
+	newPolicy KeyPolicy, approvals ...ApprovalToken) ([]EndpointResult, error) {
+	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
+		ver, err := c.UpdatePolicy(ctx, handle, newPolicy, approvals...)
+		return EndpointResult{PolicyVersion: ver}, err
 	})
 }
 
