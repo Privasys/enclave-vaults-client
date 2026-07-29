@@ -412,9 +412,15 @@ type Mutability struct {
 	Immutable  []PolicyField `json:"immutable,omitempty"`
 }
 
-// Lifecycle defines the key TTL.
+// Lifecycle defines the key TTL and the auto-migrate opt-in.
 type Lifecycle struct {
 	TTLSeconds uint64 `json:"ttl_seconds,omitempty"`
+	// AutoMigrate ("auto-rolling", enclave-upgrade item 2): the owner's
+	// standing opt-in for the vault to accept a PLATFORM-staged profile that
+	// differs from an accepted one only in the runtime measurement
+	// (MRENCLAVE / MRTD+RTMRs) — app-code digest and app id unchanged —
+	// without a fresh owner promote. Only the key owner may change it.
+	AutoMigrate bool `json:"auto_migrate_to_next_attestation_profile,omitempty"`
 }
 
 // KeyPolicy is the full per-key access policy.
@@ -438,6 +444,10 @@ type PendingProfile struct {
 	Source      PendingProfileSource `json:"source"`
 	StagedAt    uint64               `json:"staged_at"`
 	StagedBySub string               `json:"staged_by_sub"`
+	// StagedByPlatform is set by the VAULT when the stager was the platform
+	// (manager-role bearer via the staging-only capability), never a key
+	// principal. Server-derived; the caller-supplied Source is advisory.
+	StagedByPlatform bool `json:"staged_by_platform,omitempty"`
 }
 
 // KeyInfo is public metadata for a key.
@@ -626,6 +636,11 @@ type vaultResponse struct {
 	} `json:"AuditLog,omitempty"`
 	PendingProfileStaged *struct {
 		PendingID uint32 `json:"pending_id"`
+		// AutoPromoted: no owner promote needed — the profile is active
+		// (auto-migrate accepted it, or it was already an accepted
+		// principal). PendingID is meaningless (0) when set.
+		AutoPromoted  bool   `json:"auto_promoted"`
+		PolicyVersion uint32 `json:"policy_version"`
 	} `json:"PendingProfileStaged,omitempty"`
 	PendingProfileList *struct {
 		Pending []PendingProfile `json:"pending"`
@@ -1062,19 +1077,42 @@ func (c *Client) ReadAuditLog(ctx context.Context, handle string, sinceSeq uint6
 	return resp.AuditLog.Entries, resp.AuditLog.NextSeq, nil
 }
 
+// StageOutcome is the vault's full staging outcome.
+type StageOutcome struct {
+	PendingID uint32
+	// AutoPromoted: the profile is active without an owner promote (the
+	// key's auto-migrate opt-in accepted a runtime-only delta, or the
+	// profile was already an accepted principal). PendingID is meaningless
+	// when true.
+	AutoPromoted  bool
+	PolicyVersion uint32
+}
+
 // StagePendingProfile stages an attestation profile on this vault.
 func (c *Client) StagePendingProfile(ctx context.Context, handle string,
 	profile AttestationProfile, source PendingProfileSource) (uint32, error) {
+	out, err := c.StagePendingProfileOutcome(ctx, handle, profile, source)
+	return out.PendingID, err
+}
+
+// StagePendingProfileOutcome stages an attestation profile and returns the
+// vault's full outcome, including whether it was auto-promoted.
+func (c *Client) StagePendingProfileOutcome(ctx context.Context, handle string,
+	profile AttestationProfile, source PendingProfileSource) (StageOutcome, error) {
 	resp, err := c.call(ctx, vaultRequest{StagePendingProfile: &stagePendingProfileReq{
 		Handle: handle, Profile: profile, Source: source,
 	}})
 	if err != nil {
-		return 0, err
+		return StageOutcome{}, err
 	}
 	if resp.PendingProfileStaged == nil {
-		return 0, ErrUnexpectedResponse
+		return StageOutcome{}, ErrUnexpectedResponse
 	}
-	return resp.PendingProfileStaged.PendingID, nil
+	return StageOutcome{
+		PendingID:     resp.PendingProfileStaged.PendingID,
+		AutoPromoted:  resp.PendingProfileStaged.AutoPromoted,
+		PolicyVersion: resp.PendingProfileStaged.PolicyVersion,
+	}, nil
 }
 
 // ListPendingProfiles returns currently-staged profiles for a key on
@@ -1139,6 +1177,11 @@ type EndpointResult struct {
 	Pending       []PendingProfile
 	Material      []byte
 	Policy        *KeyPolicy
+	// AutoPromoted is set by Stage: the vault accepted the profile without
+	// an owner promote (auto-migrate opt-in matched a runtime-only delta,
+	// or the profile was already an accepted principal). PendingID is
+	// meaningless when true.
+	AutoPromoted bool
 }
 
 // Constellation fans operations out to every vault in the constellation.
@@ -1221,8 +1264,12 @@ func (con *Constellation) forEach(ctx context.Context,
 func (con *Constellation) StagePendingProfile(ctx context.Context, handle string,
 	profile AttestationProfile, source PendingProfileSource) ([]EndpointResult, error) {
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
-		id, err := c.StagePendingProfile(ctx, handle, profile, source)
-		return EndpointResult{PendingID: id}, err
+		out, err := c.StagePendingProfileOutcome(ctx, handle, profile, source)
+		return EndpointResult{
+			PendingID:     out.PendingID,
+			AutoPromoted:  out.AutoPromoted,
+			PolicyVersion: out.PolicyVersion,
+		}, err
 	})
 }
 
