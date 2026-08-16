@@ -243,12 +243,15 @@ type AttestationProfile struct {
 	Measurements       []Measurement       `json:"measurements"`
 	AttestationServers []AttestationServer `json:"attestation_servers"`
 	RequiredOIDs       []OidRequirement    `json:"required_oids,omitempty"`
-	// AcceptableTCBStatuses relaxes the secure Intel TCB floor (UpToDate,
-	// SWHardeningNeeded) for this profile, e.g. "ConfigurationAndSWHardeningNeeded" on
-	// a platform whose BIOS/config cannot be changed. Revoked is never accepted. Empty
-	// = floor only. Mirrors the vault constellation's acceptable set, for the per-app
-	// measurement policy path.
-	AcceptableTCBStatuses []string `json:"acceptable_tcb_statuses,omitempty"`
+	// AcceptableTCBStatuses is the profile's opt-in Intel TCB-status enforcement,
+	// mirroring the vault enclave's tri-state field (enclave-os-vault types.rs):
+	//   nil  → marshals as null → vault sees None → NO TCB check (legacy; Revoked
+	//          still always rejected),
+	//   []   → Some([]) → strict floor-only (UpToDate/SWHardeningNeeded),
+	//   [..] → Some(set) → floor plus the listed statuses (e.g.
+	//          "ConfigurationAndSWHardeningNeeded"); Revoked never accepted.
+	// Deliberately NOT omitempty: [] and absent mean different policies.
+	AcceptableTCBStatuses []string `json:"acceptable_tcb_statuses"`
 }
 
 // Measurement is one acceptable enclave/VM measurement. The wire form mirrors
