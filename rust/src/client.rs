@@ -21,6 +21,7 @@
 //! used by [`Constellation::create_key_shares`] to split a secret into a
 //! per-vault share supplied as each vault's `create_key` material.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -28,7 +29,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use ratls_client::{RaTlsClient, VerificationPolicy};
+use ratls_client::attest::{ClientEvidence, ClientEvidenceRequest};
+use ratls_client::{ConnectOptions, RaTlsClient, VerificationPolicy};
 
 // ===========================================================================
 //  Errors
@@ -598,7 +600,21 @@ pub struct DialOptions {
 
     /// PKCS#8 DER-encoded private key matching `client_cert_der`.
     pub client_key_pkcs8: Option<Vec<u8>>,
+
+    /// Produces evidence for the presented client identity when the vault
+    /// requires it (RA-TLS v2 mutual leg, `client_evidence: required`): a
+    /// quote whose report_data commits to the client leaf key, the vault's
+    /// `client_context` and this connection's exporter value. Shared across
+    /// reconnects, hence `Arc`. `None` leaves the dial server-auth only
+    /// (a vault that requires client evidence then refuses the session).
+    pub client_evidence: Option<ClientEvidenceProvider>,
 }
+
+/// Shareable evidence source for the mutual RA-TLS v2 leg (see
+/// [`DialOptions::client_evidence`]).
+pub type ClientEvidenceProvider = Arc<
+    dyn Fn(&ClientEvidenceRequest) -> std::result::Result<ClientEvidence, String> + Send + Sync,
+>;
 
 impl Default for DialOptions {
     fn default() -> Self {
@@ -608,6 +624,7 @@ impl Default for DialOptions {
             vault_policy: None,
             client_cert_der: None,
             client_key_pkcs8: None,
+            client_evidence: None,
         }
     }
 }
@@ -647,18 +664,32 @@ impl Client {
         let host = self.registration.host();
         let port = self.registration.port();
 
-        let conn = match (&self.opts.client_cert_der, &self.opts.client_key_pkcs8) {
-            (Some(chain), Some(key)) => RaTlsClient::connect_mutual(
-                host,
-                port,
-                ca,
-                chain.clone(),
-                key.clone(),
-            )
-            .map_err(|e| Error::Transport(format!("mutual ratls dial {host}:{port}: {e}")))?,
-            _ => RaTlsClient::connect(host, port, ca)
-                .map_err(|e| Error::Transport(format!("ratls dial {host}:{port}: {e}")))?,
+        // Challenge mode (the default): the vault's evidence is requested
+        // after the handshake and bound to this connection's exporter value.
+        // The client identity, when configured, is presented in the
+        // handshake and proven by client evidence on demand.
+        let mut opts = ConnectOptions {
+            ca_cert_pem: ca.map(str::to_string),
+            ..ConnectOptions::default()
         };
+        if let (Some(chain), Some(key)) = (&self.opts.client_cert_der, &self.opts.client_key_pkcs8)
+        {
+            opts.client_cert_der = Some(chain.clone());
+            opts.client_key_pkcs8 = Some(key.clone());
+            if let Some(source) = &self.opts.client_evidence {
+                let source = Arc::clone(source);
+                opts.client_evidence = Some(Box::new(move |req| source(req)));
+            }
+        }
+        let mutual = opts.client_cert_der.is_some();
+        let mut conn = RaTlsClient::connect_with(host, port, opts).map_err(|e| {
+            let what = if mutual {
+                "mutual ratls dial"
+            } else {
+                "ratls dial"
+            };
+            Error::Transport(format!("{what} {host}:{port}: {e}"))
+        })?;
 
         if let Some(policy) = &self.opts.vault_policy {
             conn.verify_certificate(policy)
@@ -686,11 +717,7 @@ impl Client {
                 *guard = Some(self.open_connection()?);
             }
 
-            let first_err = match guard
-                .as_mut()
-                .unwrap()
-                .send_data(&payload, token_ref)
-            {
+            let first_err = match guard.as_mut().unwrap().send_data(&payload, token_ref) {
                 Ok(b) => return decode_response(&b),
                 Err(e) => e,
             };
@@ -698,9 +725,7 @@ impl Client {
             // Retry once on transport error with a fresh connection.
             *guard = None;
             *guard = Some(self.open_connection().map_err(|e| {
-                Error::Transport(format!(
-                    "send failed ({first_err}); reconnect failed: {e}"
-                ))
+                Error::Transport(format!("send failed ({first_err}); reconnect failed: {e}"))
             })?);
             guard
                 .as_mut()
@@ -969,9 +994,16 @@ fn decode_response(body: &[u8]) -> Result<VaultResponse> {
     // Serde encodes unit enum variants as bare JSON strings (e.g.
     // `"KeyDeleted"`). Inflate those to `{"KeyDeleted": null}` for
     // serde_json's tag dispatch.
-    let trimmed_len = body.iter().rev().take_while(|b| b.is_ascii_whitespace()).count();
+    let trimmed_len = body
+        .iter()
+        .rev()
+        .take_while(|b| b.is_ascii_whitespace())
+        .count();
     let body = &body[..body.len() - trimmed_len];
-    let body = body.iter().position(|b| !b.is_ascii_whitespace()).map_or(body, |i| &body[i..]);
+    let body = body
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map_or(body, |i| &body[i..]);
 
     let resp: VaultResponse = if body.first() == Some(&b'"') && body.last() == Some(&b'"') {
         let variant = std::str::from_utf8(&body[1..body.len() - 1])
@@ -980,8 +1012,7 @@ fn decode_response(body: &[u8]) -> Result<VaultResponse> {
         serde_json::from_str(&inflated)
             .map_err(|e| Error::Codec(format!("inflate {variant}: {e}")))?
     } else {
-        serde_json::from_slice(body)
-            .map_err(|e| Error::Codec(format!("parse response: {e}")))?
+        serde_json::from_slice(body).map_err(|e| Error::Codec(format!("parse response: {e}")))?
     };
 
     if let VaultResponse::Error(msg) = resp {
@@ -1098,7 +1129,10 @@ impl Constellation {
                 Ok(c) => f(&c),
                 Err(e) => Err(e),
             };
-            out.push(EndpointResult { vault: v, result: res });
+            out.push(EndpointResult {
+                vault: v,
+                result: res,
+            });
         }
         Ok(out)
     }
@@ -1118,7 +1152,10 @@ impl Constellation {
 
     /// Query every live vault for pending profiles on `handle`.
     pub fn list_pending_profiles(&self, handle: &str) -> Result<Vec<EndpointResult>> {
-        self.for_each(|c| c.list_pending_profiles(handle).map(EndpointPayload::Pending))
+        self.for_each(|c| {
+            c.list_pending_profiles(handle)
+                .map(EndpointPayload::Pending)
+        })
     }
 
     /// Promote `pending_id` on every live vault, carrying `approvals`.
@@ -1180,7 +1217,10 @@ impl Constellation {
                     .map(|_| EndpointPayload::Empty),
                 Err(e) => Err(e),
             };
-            out.push(EndpointResult { vault: v, result: res });
+            out.push(EndpointResult {
+                vault: v,
+                result: res,
+            });
         }
         Ok((out, share_bytes))
     }
