@@ -726,22 +726,20 @@ type DialOptions struct {
 	// human-driven calls authenticated by AuthToken.
 	ClientCert *tls.Certificate
 
-	// GetClientCertificate is a callback for dynamic RA-TLS client cert
-	// generation that binds the server's challenge nonce. Takes
-	// precedence over ClientCert when both are set.
+	// GetClientCertificate selects the RA-TLS client certificate (a v2
+	// identity: leaf key, chain, OIDs, no evidence). Takes precedence over
+	// ClientCert when both are set.
 	GetClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
 
-	// Challenge is a per-connection nonce sent in the TLS ClientHello
-	// (RA-TLS extension 0xFFBB). It serves two purposes: (1) the vault
-	// binds it into the ReportData of a freshly generated server cert, so
-	// the client can verify the vault's quote via challenge-response
-	// (VaultPolicy.ReportData = ReportDataChallengeResponse, Nonce =
-	// Challenge) rather than relying on a deterministic binding; and (2) it
-	// puts the vault into bidirectional-challenge mode, in which it issues
-	// its own challenge in the TLS CertificateRequest — required for the
-	// vault to accept a challenge-bound Tee client certificate. Nil for
-	// plain owner-authenticated calls that present no client cert.
-	Challenge []byte
+	// ClientEvidence produces this client's evidence when the vault requires
+	// it (mutual leg): a quote whose report_data commits to the presented
+	// certificate, the vault's client_context and this connection's exporter
+	// value. Nil for owner-authenticated calls that present no client cert.
+	ClientEvidence ratls.ClientEvidenceSource
+
+	// Attestation selects what to ask the vault for after the handshake;
+	// the zero value is challenge mode (Level 3 binding).
+	Attestation ratls.AttestationMode
 }
 
 // Client is an authenticated session against a single vault instance.
@@ -782,7 +780,8 @@ func (c *Client) reconnect(ctx context.Context) error {
 		CACertPath:           c.opts.CACertPath,
 		ClientCert:           c.opts.ClientCert,
 		GetClientCertificate: c.opts.GetClientCertificate,
-		Challenge:            c.opts.Challenge,
+		ClientEvidence:       c.opts.ClientEvidence,
+		Attestation:          c.opts.Attestation,
 	})
 	if err != nil {
 		return fmt.Errorf("vault %s: ratls dial: %w", c.registration.Endpoint, err)
