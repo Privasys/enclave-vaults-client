@@ -161,6 +161,11 @@ const (
 	Aes256GcmKey   KeyType = "Aes256GcmKey"
 	P256SigningKey KeyType = "P256SigningKey"
 	HmacSha256Key  KeyType = "HmacSha256Key"
+	// FrostEd25519 is one vault's share of a threshold Ed25519 key (FROST,
+	// RFC 9591): created by distributed key generation
+	// (Constellation.CreateThresholdKey), used by t vaults together
+	// (Constellation.SignThreshold). Never exportable.
+	FrostEd25519 KeyType = "FrostEd25519"
 )
 
 // Operation is a per-key operation that can be granted by an OperationRule.
@@ -509,6 +514,16 @@ type vaultRequest struct {
 	ListPendingProfiles   *handleReq                `json:"ListPendingProfiles,omitempty"`
 	PromotePendingProfile *promotePendingProfileReq `json:"PromotePendingProfile,omitempty"`
 	RevokePendingProfile  *revokePendingProfileReq  `json:"RevokePendingProfile,omitempty"`
+
+	FrostDkgRound1  *frostDkgRound1Req  `json:"FrostDkgRound1,omitempty"`
+	FrostDkgRound2  *frostDkgRound2Req  `json:"FrostDkgRound2,omitempty"`
+	FrostDkgRound3  *frostDkgRound3Req  `json:"FrostDkgRound3,omitempty"`
+	FrostDkgCommit  *frostDkgCommitReq  `json:"FrostDkgCommit,omitempty"`
+	FrostDkgAbort   *frostSessionReq    `json:"FrostDkgAbort,omitempty"`
+	FrostSignRound1 *frostSignRound1Req `json:"FrostSignRound1,omitempty"`
+	FrostSignRound2 *frostSignRound2Req `json:"FrostSignRound2,omitempty"`
+	FrostSignAbort  *frostSessionReq    `json:"FrostSignAbort,omitempty"`
+	FrostAggregate  *frostAggregateReq  `json:"FrostAggregate,omitempty"`
 }
 
 // MarshalJSON: ListKeys is a unit variant — encode as the bare string
@@ -658,7 +673,36 @@ type vaultResponse struct {
 		PolicyVersion uint32 `json:"policy_version"`
 	} `json:"PendingProfilePromoted,omitempty"`
 	PendingProfileRevoked *struct{} `json:"PendingProfileRevoked,omitempty"`
-	Error                 *string   `json:"Error,omitempty"`
+
+	FrostDkgRound1 *struct {
+		Package  []byte `json:"package"`
+		DhPublic []byte `json:"dh_public"`
+		Quote    []byte `json:"quote"`
+	} `json:"FrostDkgRound1,omitempty"`
+	FrostDkgSealed *struct {
+		Packages map[uint16][]byte `json:"packages"`
+	} `json:"FrostDkgSealed,omitempty"`
+	FrostDkgConfirm *struct {
+		PublicKey     []byte            `json:"public_key"`
+		Confirmations map[uint16][]byte `json:"confirmations"`
+	} `json:"FrostDkgConfirm,omitempty"`
+	ThresholdKeyCreated *struct {
+		Handle    string `json:"handle"`
+		Index     uint16 `json:"index"`
+		Threshold uint16 `json:"threshold"`
+		PublicKey []byte `json:"public_key"`
+		ExpiresAt uint64 `json:"expires_at"`
+	} `json:"ThresholdKeyCreated,omitempty"`
+	FrostCommitment *struct {
+		Index      uint16 `json:"index"`
+		Commitment []byte `json:"commitment"`
+	} `json:"FrostCommitment,omitempty"`
+	FrostSignatureShare *struct {
+		Share []byte `json:"share"`
+	} `json:"FrostSignatureShare,omitempty"`
+	FrostDone *struct{} `json:"FrostDone,omitempty"`
+
+	Error *string `json:"Error,omitempty"`
 }
 
 // errorOr returns ErrVaultError if the response was Error, else nil.
