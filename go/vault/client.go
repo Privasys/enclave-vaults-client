@@ -1053,9 +1053,48 @@ func (c *Client) UpdatePolicyRaw(ctx context.Context, handle string, newPolicy j
 	return resp.PolicyUpdated.PolicyVersion, nil
 }
 
+// UpdatePolicyRawFrom is UpdatePolicyRaw approved as update_policy_from: the
+// approval also binds replacedPD, PD of the policy being replaced as
+// GetPolicyRaw returns it. The vault refuses it if its policy has another
+// digest. Needs DialOptions.BindingMembers.
+func (c *Client) UpdatePolicyRawFrom(ctx context.Context, handle string, newPolicy json.RawMessage, replacedPD string,
+	approvals ...ApprovalToken) (uint32, error) {
+	if !json.Valid(newPolicy) {
+		return 0, errors.New("update policy: new policy is not valid JSON")
+	}
+	if !isLowerHex64(replacedPD) {
+		return 0, errors.New("update_policy_from: the replaced policy digest must be 64 lowercase hex digits")
+	}
+	payload, err := c.updatePolicyRawFromPayload(handle, newPolicy, replacedPD, approvals)
+	if err != nil {
+		return 0, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.callRaw(ctx, payload)
+	if err != nil {
+		return 0, err
+	}
+	if resp.PolicyUpdated == nil {
+		return 0, ErrUnexpectedResponse
+	}
+	return resp.PolicyUpdated.PolicyVersion, nil
+}
+
 func (c *Client) updatePolicyRawPayload(handle string, newPolicy json.RawMessage, approvals []ApprovalToken) ([]byte, error) {
+	return c.updatePolicyRawFromPayload(handle, newPolicy, "", approvals)
+}
+
+// updatePolicyRawFromPayload is the UpdatePolicy request; a non-empty
+// replacedPD makes it an update_policy_from (formats §5.3).
+func (c *Client) updatePolicyRawFromPayload(handle string, newPolicy json.RawMessage, replacedPD string, approvals []ApprovalToken) ([]byte, error) {
+	b := c.bindingMembers()
+	if replacedPD != "" {
+		if b == nil {
+			return nil, errors.New("update_policy_from needs a binding v2 member set")
+		}
+		b.ReplacedPD = replacedPD
+	}
 	return json.Marshal(map[string]updatePolicyRawReq{"UpdatePolicy": {
-		Handle: handle, NewPolicy: newPolicy, Approvals: approvals, Binding: c.bindingMembers(),
+		Handle: handle, NewPolicy: newPolicy, Approvals: approvals, Binding: b,
 	}})
 }
 
@@ -1496,6 +1535,16 @@ func (con *Constellation) UpdatePolicyRaw(ctx context.Context, handle string,
 	newPolicy json.RawMessage, approvals ...ApprovalToken) ([]EndpointResult, error) {
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
 		ver, err := c.UpdatePolicyRaw(ctx, handle, newPolicy, approvals...)
+		return EndpointResult{PolicyVersion: ver}, err
+	})
+}
+
+// UpdatePolicyRawFrom sends an update_policy_from to every vault (see
+// Client.UpdatePolicyRawFrom).
+func (con *Constellation) UpdatePolicyRawFrom(ctx context.Context, handle string, newPolicy json.RawMessage,
+	replacedPD string, approvals ...ApprovalToken) ([]EndpointResult, error) {
+	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
+		ver, err := c.UpdatePolicyRawFrom(ctx, handle, newPolicy, replacedPD, approvals...)
 		return EndpointResult{PolicyVersion: ver}, err
 	})
 }

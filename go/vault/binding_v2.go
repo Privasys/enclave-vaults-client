@@ -86,9 +86,13 @@ const (
 	BindIssuerUpdate    BindingOp = "issuer_update"
 	BindIssuerDelete    BindingOp = "issuer_delete"
 	BindUpdatePolicy    BindingOp = "update_policy"
-	BindDelete          BindingOp = "delete"
-	BindReshare         BindingOp = "reshare"
-	BindRevokePending   BindingOp = "revoke_pending"
+	// BindUpdatePolicyFrom is update_policy that also binds the policy it
+	// replaces (formats §5.3). Used only when every member lists
+	// CapabilityUpdatePolicyFrom.
+	BindUpdatePolicyFrom BindingOp = "update_policy_from"
+	BindDelete           BindingOp = "delete"
+	BindReshare          BindingOp = "reshare"
+	BindRevokePending    BindingOp = "revoke_pending"
 	// BindDeleteAfter deletes the old key of a migration or upgrade, approved
 	// in the same tap as its successor's promote or creation (DeleteAfterTarget).
 	BindDeleteAfter BindingOp = "delete_after"
@@ -98,7 +102,7 @@ func (o BindingOp) valid() bool {
 	switch o {
 	case BindCreate, BindPromote, BindExport, BindExportAssembled, BindIssuerCreate,
 		BindIssuerUpdate, BindIssuerDelete, BindUpdatePolicy, BindDelete, BindReshare, BindRevokePending,
-		BindDeleteAfter:
+		BindDeleteAfter, BindUpdatePolicyFrom:
 		return true
 	}
 	return false
@@ -586,6 +590,8 @@ func (c *Client) GetVaultIdentity(ctx context.Context) (VaultIdentity, error) {
 // approval: the sorted member set the vault rebuilds the text from.
 type bindingMembers struct {
 	Members []string `json:"members"`
+	// ReplacedPD is PD(current policy) on an update_policy_from (§5.3).
+	ReplacedPD string `json:"replaced_pd,omitempty"`
 }
 
 func (c *Client) bindingMembers() *bindingMembers {
@@ -595,4 +601,32 @@ func (c *Client) bindingMembers() *bindingMembers {
 	m := append([]string(nil), c.opts.BindingMembers...)
 	sort.Strings(m)
 	return &bindingMembers{Members: m}
+}
+
+// CapabilityUpdatePolicyFrom is advertised by a vault that accepts
+// update_policy_from (formats §5.3).
+const CapabilityUpdatePolicyFrom = "update-policy-from-v1"
+
+// UpdatePolicyFromTarget is the target of an update_policy_from: hex
+// H("privasys-update-policy-from-v1\n" PD(current) "\n" PD(new)). PD(current)
+// is the digest of the policy as GetPolicyRaw returns it, the same on every
+// member.
+func UpdatePolicyFromTarget(currentPD, newPD string) (string, error) {
+	if !isLowerHex64(currentPD) || !isLowerHex64(newPD) {
+		return "", errors.New("update_policy_from: both policy digests must be 64 lowercase hex digits")
+	}
+	sum := sha256.Sum256([]byte("privasys-update-policy-from-v1\n" + currentPD + "\n" + newPD))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func isLowerHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }
