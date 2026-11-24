@@ -479,6 +479,20 @@ type VaultIdentity struct {
 	BillingID       string `json:"billing_id"`
 	MRENCLAVE       string `json:"mrenclave"` // hex
 	QuoteB64        string `json:"quote_b64"` // base64url, no padding
+	// Capabilities are the features this vault build enforces (for example
+	// CapabilityGenerations). The quote does not cover them: they are to be
+	// believed only as read over the vault's own pinned connection.
+	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+// Has says whether the vault advertises capability.
+func (id VaultIdentity) Has(capability string) bool {
+	for _, c := range id.Capabilities {
+		if c == capability {
+			return true
+		}
+	}
+	return false
 }
 
 // Offsets in an SGX DCAP quote, version 3 or 4: a 48-byte header (version in
