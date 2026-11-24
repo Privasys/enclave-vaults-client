@@ -77,18 +77,32 @@ type Renewal struct {
 	HolderRecords   []json.RawMessage // step 3; nil until then
 	SourceBillingID string
 	KeyCheck        *KeyCheck // fresh for a move, rotation or creation; nil in place
+	// With a carried Policy: the source key's exportable flag and type, as
+	// GetKeyInfo reported them on every source vault. The target refuses a
+	// grant that differs (a carried key keeps both).
+	CarriedExportable *bool
+	CarriedKeyType    KeyType
 }
 
+// CapabilityGenerations is listed in VaultIdentity.Capabilities by a vault
+// build that reports KeyInfo.RenewedInPlaceFrom, refuses a first creation of
+// "<name>/v<n>" for n >= 2, and keeps a carried key's exportable flag and type
+// (formats §9.1). Trust a generation link only from such a build, over a
+// connection pinned to it.
+const CapabilityGenerations = "generations-v1"
+
 type renewalCreateKeyReq struct {
-	Handle          string            `json:"handle"`
-	MaterialB64     string            `json:"material_b64"`
-	Grant           string            `json:"grant"`
-	Predecessor     string            `json:"predecessor,omitempty"`
-	Policy          json.RawMessage   `json:"policy,omitempty"`
-	PolicyVersion   uint32            `json:"policy_version,omitempty"`
-	HolderRecords   []json.RawMessage `json:"holder_records,omitempty"`
-	SourceBillingID string            `json:"source_billing_id,omitempty"`
-	KeyCheck        *KeyCheck         `json:"key_check,omitempty"`
+	Handle            string            `json:"handle"`
+	MaterialB64       string            `json:"material_b64"`
+	Grant             string            `json:"grant"`
+	Predecessor       string            `json:"predecessor,omitempty"`
+	Policy            json.RawMessage   `json:"policy,omitempty"`
+	PolicyVersion     uint32            `json:"policy_version,omitempty"`
+	HolderRecords     []json.RawMessage `json:"holder_records,omitempty"`
+	SourceBillingID   string            `json:"source_billing_id,omitempty"`
+	KeyCheck          *KeyCheck         `json:"key_check,omitempty"`
+	CarriedExportable *bool             `json:"carried_exportable,omitempty"`
+	CarriedKeyType    KeyType           `json:"carried_key_type,omitempty"`
 }
 
 // CreateKeyRenewal creates the next generation of a key under handle, with
@@ -101,16 +115,21 @@ func (c *Client) CreateKeyRenewal(ctx context.Context, handle string, material [
 	if len(r.Policy) != 0 && r.SourceBillingID == "" {
 		return 0, errors.New("vault: a carried policy needs the source billing id")
 	}
+	if len(r.Policy) != 0 && (r.CarriedExportable == nil || r.CarriedKeyType == "") {
+		return 0, errors.New("vault: a carried policy needs the source key's exportable flag and type")
+	}
 	req := renewalCreateKeyReq{
-		Handle:          handle,
-		MaterialB64:     base64.RawURLEncoding.EncodeToString(material),
-		Grant:           grant,
-		Predecessor:     r.Predecessor,
-		Policy:          r.Policy,
-		PolicyVersion:   r.PolicyVersion,
-		HolderRecords:   r.HolderRecords,
-		SourceBillingID: r.SourceBillingID,
-		KeyCheck:        r.KeyCheck,
+		Handle:            handle,
+		MaterialB64:       base64.RawURLEncoding.EncodeToString(material),
+		Grant:             grant,
+		Predecessor:       r.Predecessor,
+		Policy:            r.Policy,
+		PolicyVersion:     r.PolicyVersion,
+		HolderRecords:     r.HolderRecords,
+		SourceBillingID:   r.SourceBillingID,
+		KeyCheck:          r.KeyCheck,
+		CarriedExportable: r.CarriedExportable,
+		CarriedKeyType:    r.CarriedKeyType,
 	}
 	body, err := json.Marshal(map[string]any{"CreateKey": req})
 	if err != nil {

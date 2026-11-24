@@ -482,6 +482,10 @@ type KeyInfo struct {
 	PublicKey     []byte  `json:"public_key,omitempty"`
 	// Threshold is set for a FrostEd25519 key: this vault's part (public).
 	Threshold *ThresholdKeyInfo `json:"threshold,omitempty"`
+	// RenewedInPlaceFrom is the key this one renewed in place on this vault
+	// (formats §9.1); empty for a first creation or a carried move. Trust it
+	// only from a vault whose identity lists CapabilityGenerations.
+	RenewedInPlaceFrom string `json:"renewed_in_place_from,omitempty"`
 }
 
 // ThresholdKeyInfo is what one vault holds of a threshold key (public).
