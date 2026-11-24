@@ -597,6 +597,14 @@ type updatePolicyReq struct {
 	Binding   *bindingMembers `json:"binding,omitempty"`
 }
 
+// updatePolicyRawReq is updatePolicyReq with the policy as raw JSON.
+type updatePolicyRawReq struct {
+	Handle    string          `json:"handle"`
+	NewPolicy json.RawMessage `json:"new_policy"`
+	Approvals []ApprovalToken `json:"approvals,omitempty"`
+	Binding   *bindingMembers `json:"binding,omitempty"`
+}
+
 type wrapReq struct {
 	Handle       string          `json:"handle"`
 	PlaintextB64 string          `json:"plaintext_b64"`
@@ -977,6 +985,36 @@ func (c *Client) UpdatePolicy(ctx context.Context, handle string, newPolicy KeyP
 		return 0, ErrUnexpectedResponse
 	}
 	return resp.PolicyUpdated.PolicyVersion, nil
+}
+
+// UpdatePolicyRaw replaces the policy on an existing key with newPolicy as
+// given, never re-serialised: a binding v2 update_policy approval binds the
+// digest of the policy JSON the owner was shown (PD, binding v2 §5.1), so the
+// request must carry that JSON, with exactly its fields. The bytes are
+// compacted on the wire, which the digest (over the JCS form) does not see.
+func (c *Client) UpdatePolicyRaw(ctx context.Context, handle string, newPolicy json.RawMessage,
+	approvals ...ApprovalToken) (uint32, error) {
+	if !json.Valid(newPolicy) {
+		return 0, errors.New("update policy: new policy is not valid JSON")
+	}
+	payload, err := c.updatePolicyRawPayload(handle, newPolicy, approvals)
+	if err != nil {
+		return 0, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.callRaw(ctx, payload)
+	if err != nil {
+		return 0, err
+	}
+	if resp.PolicyUpdated == nil {
+		return 0, ErrUnexpectedResponse
+	}
+	return resp.PolicyUpdated.PolicyVersion, nil
+}
+
+func (c *Client) updatePolicyRawPayload(handle string, newPolicy json.RawMessage, approvals []ApprovalToken) ([]byte, error) {
+	return json.Marshal(map[string]updatePolicyRawReq{"UpdatePolicy": {
+		Handle: handle, NewPolicy: newPolicy, Approvals: approvals, Binding: c.bindingMembers(),
+	}})
 }
 
 // GetPolicy reads the current policy + version for a key.
@@ -1402,6 +1440,16 @@ func (con *Constellation) UpdatePolicy(ctx context.Context, handle string,
 	newPolicy KeyPolicy, approvals ...ApprovalToken) ([]EndpointResult, error) {
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
 		ver, err := c.UpdatePolicy(ctx, handle, newPolicy, approvals...)
+		return EndpointResult{PolicyVersion: ver}, err
+	})
+}
+
+// UpdatePolicyRaw fans a raw policy replacement out to every live vault (see
+// Client.UpdatePolicyRaw).
+func (con *Constellation) UpdatePolicyRaw(ctx context.Context, handle string,
+	newPolicy json.RawMessage, approvals ...ApprovalToken) ([]EndpointResult, error) {
+	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
+		ver, err := c.UpdatePolicyRaw(ctx, handle, newPolicy, approvals...)
 		return EndpointResult{PolicyVersion: ver}, err
 	})
 }

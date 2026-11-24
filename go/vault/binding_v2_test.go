@@ -251,3 +251,33 @@ func TestApprovalRequestsCarryTheBindingMembers(t *testing.T) {
 		t.Fatalf("a v1 request carries a binding: %s", plain)
 	}
 }
+
+func TestUpdatePolicyRawSendsThePolicyAsGiven(t *testing.T) {
+	// Fields in a non-struct order, one known field left out: the vault must
+	// receive exactly these, so its digest is the one the owner approved.
+	policy := json.RawMessage(`{"operations": [], "lifecycle": {"ttl_seconds": 0}}`)
+	c := &Client{opts: DialOptions{BindingMembers: []string{memberA}}}
+	raw, err := c.updatePolicyRawPayload("h", policy, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"UpdatePolicy":{"handle":"h","new_policy":{"operations":[],"lifecycle":{"ttl_seconds":0}},"binding":{"members":["` + memberA + `"]}}}`
+	if string(raw) != want {
+		t.Fatalf("got  %s\nwant %s", raw, want)
+	}
+	var sent struct {
+		UpdatePolicy struct {
+			NewPolicy json.RawMessage `json:"new_policy"`
+		}
+	}
+	if err := json.Unmarshal(raw, &sent); err != nil {
+		t.Fatal(err)
+	}
+	a, err := PolicyDigestJSON(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := PolicyDigestJSON(sent.UpdatePolicy.NewPolicy); a != b {
+		t.Fatalf("digest changed on the wire: %s -> %s", a, b)
+	}
+}
