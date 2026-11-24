@@ -4,6 +4,7 @@
 package vault
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -111,9 +112,100 @@ func TestCanonicalJSON(t *testing.T) {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
 
-	for _, bad := range []string{`{"a":1,"a":2}`, `{"a":1.5}`, `{"a":9007199254740993}`, `{"a":1} {}`, `{"a":1} x`, `{"a":"\xff"}`} {
+	for _, bad := range []string{`{"a":1,"a":2}`, `{"a":1.5}`, `{"a":9007199254740993}`, `{"a":1} {}`, `{"a":1} x`, `{"a":"\xff"}`, `{"a":"\ud800"}`, `{"a":"�"}`} {
 		if _, err := CanonicalJSON([]byte(bad)); err == nil {
 			t.Errorf("accepted %s", bad)
 		}
+	}
+}
+
+// The vector of the formats' §5.2, computed from the specification's text.
+func TestBindingV2SpecVector(t *testing.T) {
+	b := BindingV2{
+		Members:       []string{strings.Repeat("2", 64), strings.Repeat("1", 64)},
+		Op:            BindUpdatePolicy,
+		Handle:        "apps.privasys.org/0123456789abcdef0123456789abcdef/data-v2",
+		Target:        "3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b",
+		PolicyVersion: 3, Approver: "oidc:0:test-subject-1",
+		Nonce: "AAECAwQFBgcICQoLDA0ODw", Exp: 1764000600,
+	}
+	text, err := b.Text()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(text) != 356 {
+		t.Fatalf("text is %d bytes, the vector's is 356", len(text))
+	}
+	sum := sha256.Sum256([]byte(text))
+	if hex.EncodeToString(sum[:]) != "f4fe5392066464c3e92ca26c442af4f53d2009e87532a398923cea5f95f31b23" {
+		t.Fatal("H(text) differs from the vector")
+	}
+	if op, _ := b.VaultOp(); op != "9P5TkgZkZMPpLKJsRCr09T0gCeh1MqOYkjzqX5XzGyM" {
+		t.Fatalf("vault_op %s differs from the vector", op)
+	}
+}
+
+func TestPolicyDigestNames(t *testing.T) {
+	if _, err := PolicyDigestJSON([]byte(`{"né":1}`)); err == nil {
+		t.Fatal("a non-ASCII member name was accepted in a policy")
+	}
+	a, err := PolicyDigestJSON([]byte(`{"b":"café","a":[{"y":1,"x":[2]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := PolicyDigestJSON([]byte(`{"a":[{"x":[2],"y":1}],"b":"café"}`))
+	if a != b {
+		t.Fatal("the same policy written two ways gave two digests")
+	}
+}
+
+// identityQuote is an unsigned SGX v3 quote carrying a member id and billing id.
+func identityQuote(mid, billing string, mr []byte) []byte {
+	quote := make([]byte, sgxQuoteReportData+64)
+	quote[0] = 3
+	copy(quote[sgxQuoteMrEnclave:], mr)
+	rd := IdentityReportData(mid, billing)
+	copy(quote[sgxQuoteReportData:], rd[:])
+	return quote
+}
+
+func TestVaultIdentityCheckConsistent(t *testing.T) {
+	pub := make([]byte, 65)
+	pub[0], pub[64] = 0x04, 7
+	mid, _ := MemberID(pub)
+	mr := strings.Repeat("ab", 32)
+	mrb, _ := hex.DecodeString(mr)
+	quote := identityQuote(mid, "bill", mrb)
+	id := VaultIdentity{MemberID: mid, MemberPublicKey: hex.EncodeToString(pub), BillingID: "bill",
+		MRENCLAVE: mr, QuoteB64: base64.RawURLEncoding.EncodeToString(quote)}
+	if err := id.CheckConsistent(); err != nil {
+		t.Fatal(err)
+	}
+	withQuote := func(f func(q []byte)) string {
+		q := append([]byte(nil), quote...)
+		f(q)
+		return base64.RawURLEncoding.EncodeToString(q)
+	}
+	for name, mut := range map[string]func(*VaultIdentity){
+		"member id":  func(v *VaultIdentity) { v.MemberID = memberA },
+		"billing":    func(v *VaultIdentity) { v.BillingID = "other" },
+		"mrenclave":  func(v *VaultIdentity) { v.MRENCLAVE = strings.Repeat("cd", 32) },
+		"short":      func(v *VaultIdentity) { v.QuoteB64 = base64.RawURLEncoding.EncodeToString(quote[:100]) },
+		"padded b64": func(v *VaultIdentity) { v.QuoteB64 += "=" },
+		"v5 quote":   func(v *VaultIdentity) { v.QuoteB64 = withQuote(func(q []byte) { q[0] = 5 }) },
+		"tdx quote":  func(v *VaultIdentity) { v.QuoteB64 = withQuote(func(q []byte) { q[4] = 0x81 }) },
+	} {
+		v := id
+		mut(&v)
+		if err := v.CheckConsistent(); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestGetVaultIdentityNeedsPinnedMRENCLAVE(t *testing.T) {
+	c := &Client{}
+	if _, err := c.GetVaultIdentity(context.Background()); err == nil || !strings.Contains(err.Error(), "pin") {
+		t.Fatalf("an unpinned connection was used: %v", err)
 	}
 }

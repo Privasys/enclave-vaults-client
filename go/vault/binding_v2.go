@@ -20,11 +20,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
 	"fmt"
+	"io"
 	"math/big"
 	"sort"
 	"strconv"
@@ -387,6 +388,11 @@ func writeJCSString(w *bytes.Buffer, s string) error {
 	if !utf8.ValidString(s) {
 		return errors.New("canonical json: a string is not valid UTF-8")
 	}
+	// Go decodes a lone surrogate escape (\ud800) as U+FFFD where serde
+	// refuses it, so U+FFFD is refused: the two never digest different text.
+	if strings.ContainsRune(s, utf8.RuneError) {
+		return errors.New("canonical json: a string holds U+FFFD or a lone surrogate")
+	}
 	w.WriteByte('"')
 	for _, r := range s {
 		switch r {
@@ -440,22 +446,25 @@ type VaultIdentity struct {
 	QuoteB64        string `json:"quote_b64"` // base64url, no padding
 }
 
-// Offsets in an SGX DCAP quote (v3 or v4): a 48-byte header, then the report
-// body, whose MRENCLAVE is at 64 and report data at 320.
+// Offsets in an SGX DCAP quote, version 3 or 4: a 48-byte header (version in
+// bytes 0-1, little-endian; TEE type in bytes 4-7, 0 for SGX), then the report
+// body, whose MRENCLAVE is at 64 and report data at 320. A v5 quote inserts a
+// body descriptor and a TDX quote has another body, so both are refused.
 const (
 	sgxQuoteMrEnclave  = 48 + 64
 	sgxQuoteReportData = 48 + 320
 )
 
-// Check verifies the identity is self-consistent: member_id is the hash of the
-// member key, and the quote carries that member id, the billing id and the
-// MRENCLAVE in its report.
+// CheckConsistent checks the identity agrees with itself: member_id is the hash
+// of the member key, and the quote is an SGX v3/v4 quote whose report data
+// commits to that member id and billing id and whose MRENCLAVE is the one
+// stated.
 //
-// It does not verify the quote's signature chain. A client that asked for the
-// identity over the vault's own RA-TLS connection has already attested that
-// enclave; the quote is for whoever receives the identity relayed (the wallet),
-// who verifies it against the published vault releases.
-func (id VaultIdentity) Check() error {
+// It AUTHENTICATES NOTHING. It does not verify the quote's signature chain, and
+// anyone can build an identity that passes. An identity is trustworthy only as
+// GetVaultIdentity obtains it, or once its quote is verified (as the wallet
+// does, against the published vault releases).
+func (id VaultIdentity) CheckConsistent() error {
 	pub, err := hex.DecodeString(id.MemberPublicKey)
 	if err != nil {
 		return errors.New("vault identity: the member key is not hex")
@@ -474,6 +483,12 @@ func (id VaultIdentity) Check() error {
 	if len(quote) < sgxQuoteReportData+64 {
 		return errors.New("vault identity: the quote is too short")
 	}
+	if v := binary.LittleEndian.Uint16(quote[0:2]); v != 3 && v != 4 {
+		return fmt.Errorf("vault identity: quote version %d is not an SGX v3 or v4 quote", v)
+	}
+	if tee := binary.LittleEndian.Uint32(quote[4:8]); tee != 0 {
+		return errors.New("vault identity: the quote is not an SGX quote")
+	}
 	rd := IdentityReportData(id.MemberID, id.BillingID)
 	if !bytes.Equal(quote[sgxQuoteReportData:sgxQuoteReportData+32], rd[:]) {
 		return errors.New("vault identity: the quote does not carry this member id and billing id")
@@ -484,18 +499,36 @@ func (id VaultIdentity) Check() error {
 	return nil
 }
 
-// GetVaultIdentity reads the vault's identity and checks it is
-// self-consistent. Unauthenticated at the vault.
+// GetVaultIdentity reads the vault's identity. Unauthenticated at the vault.
+//
+// The member id may be trusted only because the answer came over this client's
+// RA-TLS connection, and only when that connection's verification pinned an
+// expected MRENCLAVE (DialOptions.VaultPolicy): the identity must then state
+// that MRENCLAVE. Without a pinned MRENCLAVE the identity may come from any SGX
+// enclave, so it is refused. A wrong member set cannot forge an approval (each
+// vault refuses one that does not name it), but it widens where an approval
+// is valid, which is the separation the member set exists for.
 func (c *Client) GetVaultIdentity(ctx context.Context) (VaultIdentity, error) {
+	pinned := []byte(nil)
+	if c.opts.VaultPolicy != nil {
+		pinned = c.opts.VaultPolicy.MRENCLAVE
+	}
+	if len(pinned) != 32 {
+		return VaultIdentity{}, errors.New("vault identity: the connection does not pin an MRENCLAVE, so the vault's identity cannot be trusted")
+	}
 	resp, err := c.call(ctx, vaultRequest{GetVaultIdentity: true})
 	if err != nil {
 		return VaultIdentity{}, err
 	}
-	if resp.VaultIdentity == nil {
+	id := resp.VaultIdentity
+	if id == nil {
 		return VaultIdentity{}, ErrUnexpectedResponse
 	}
-	if err := resp.VaultIdentity.Check(); err != nil {
+	if err := id.CheckConsistent(); err != nil {
 		return VaultIdentity{}, err
 	}
-	return *resp.VaultIdentity, nil
+	if strings.ToLower(id.MRENCLAVE) != hex.EncodeToString(pinned) {
+		return VaultIdentity{}, errors.New("vault identity: the identity names another MRENCLAVE than the attested connection")
+	}
+	return *id, nil
 }

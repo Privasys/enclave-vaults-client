@@ -516,7 +516,7 @@ type vaultRequest struct {
 	GetKeyInfo            *handleReq                `json:"GetKeyInfo,omitempty"`
 	ListKeys              bool                      `json:"-"`
 	GetVaultIdentity      bool                      `json:"-"`
-	Wrap               *wrapReq                  `json:"Wrap,omitempty"`
+	Wrap                  *wrapReq                  `json:"Wrap,omitempty"`
 	Unwrap                *unwrapReq                `json:"Unwrap,omitempty"`
 	Sign                  *signOrMacReq             `json:"Sign,omitempty"`
 	Mac                   *signOrMacReq             `json:"Mac,omitempty"`
