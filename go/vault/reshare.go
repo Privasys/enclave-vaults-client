@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -136,9 +137,21 @@ type ReshareParams struct {
 	// InPlace: Target is the key's own constellation (same vaults).
 	InPlace bool
 	// StepUp returns the owner's bearer with a fresh wallet approval of
-	// operation "reshare" for Handle, whose measurement slot is contextHex,
-	// at the key's policyVersion.
-	StepUp func(ctx context.Context, contextHex string, policyVersion uint32) (string, error)
+	// operation "reshare" for Handle, whose measurement slot is
+	// a.ContextHex, at a.PolicyVersion.
+	StepUp func(ctx context.Context, a ReshareApproval) (string, error)
+}
+
+// ReshareApproval is what the owner approves: the resharing context and every
+// input of it, so a wallet can recompute ContextHex from what it displays.
+type ReshareApproval struct {
+	ContextHex      string
+	PolicyVersion   uint32
+	GroupKey        []byte
+	Helpers         []uint16
+	Threshold       uint16
+	Vaults          []string
+	TargetMrenclave string
 }
 
 // ReshareThresholdKey renews a threshold key, or moves it to another
@@ -260,7 +273,11 @@ func ReshareThresholdKey(ctx context.Context, p ReshareParams) (*ThresholdKey, e
 		return nil, err
 	}
 	rc := ReshareContext(p.Handle, groupKey, helperIdx, uint16(p.Threshold), p.Target, mr)
-	stepUp, err := p.StepUp(ctx, hex.EncodeToString(rc), helpers[0].pv)
+	stepUp, err := p.StepUp(ctx, ReshareApproval{
+		ContextHex: hex.EncodeToString(rc), PolicyVersion: helpers[0].pv, GroupKey: groupKey,
+		Helpers: helperIdx, Threshold: uint16(p.Threshold), Vaults: p.Target,
+		TargetMrenclave: strings.ToLower(p.TargetMrenclave),
+	})
 	if err != nil {
 		abort()
 		return nil, fmt.Errorf("owner approval: %w", err)
