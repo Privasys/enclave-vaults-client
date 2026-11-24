@@ -4,6 +4,7 @@
 package vault
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -53,5 +54,20 @@ func TestFrostResponsesDecodeFromTheVault(t *testing.T) {
 	r, err = unmarshalResponse([]byte(`{"ThresholdKeyCreated":{"handle":"h","index":1,"threshold":2,"public_key":[7],"expires_at":42}}`))
 	if err != nil || r.ThresholdKeyCreated.ExpiresAt != 42 || r.ThresholdKeyCreated.PublicKey[0] != 7 {
 		t.Fatalf("created = %+v, %v", r.ThresholdKeyCreated, err)
+	}
+}
+
+// The resharing context the owner approves is the one the vaults compute
+// (the Rust vault asserts the same vector in threshold.rs).
+func TestReshareContextMatchesTheVault(t *testing.T) {
+	group := make([]byte, 32)
+	mr := make([]byte, 32)
+	for i := range group {
+		group[i], mr[i] = 1, 9
+	}
+	got := ReshareContext("vaults/x/k", group, []uint16{1, 3}, 2, []string{"a:1", "b:2", "c:3"}, mr)
+	const want = "e6077b2adf28720e9348c478cc1668cf47604c8b4ede5d3def858bc65d7b6ea6"
+	if h := hex.EncodeToString(got); h != want {
+		t.Fatalf("context = %s, want %s", h, want)
 	}
 }

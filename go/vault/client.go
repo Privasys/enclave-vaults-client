@@ -473,6 +473,17 @@ type KeyInfo struct {
 	ExpiresAt     uint64  `json:"expires_at"`
 	PolicyVersion uint32  `json:"policy_version"`
 	PublicKey     []byte  `json:"public_key,omitempty"`
+	// Threshold is set for a FrostEd25519 key: this vault's part (public).
+	Threshold *ThresholdKeyInfo `json:"threshold,omitempty"`
+}
+
+// ThresholdKeyInfo is what one vault holds of a threshold key (public).
+type ThresholdKeyInfo struct {
+	Index            uint16   `json:"index"`
+	Threshold        uint16   `json:"threshold"`
+	Participants     uint16   `json:"participants"`
+	Vaults           []string `json:"vaults"`
+	PublicKeyPackage []byte   `json:"public_key_package"`
 }
 
 // KeyListEntry is one entry from VaultRequest::ListKeys.
@@ -524,6 +535,14 @@ type vaultRequest struct {
 	FrostSignRound2 *frostSignRound2Req `json:"FrostSignRound2,omitempty"`
 	FrostSignAbort  *frostSessionReq    `json:"FrostSignAbort,omitempty"`
 	FrostAggregate  *frostAggregateReq  `json:"FrostAggregate,omitempty"`
+
+	FrostReshareTarget1  *frostReshareTarget1Req `json:"FrostReshareTarget1,omitempty"`
+	FrostReshareDeal     *frostReshareDealReq    `json:"FrostReshareDeal,omitempty"`
+	FrostReshareTarget2  *frostReshareTarget2Req `json:"FrostReshareTarget2,omitempty"`
+	FrostReshareCommit   *frostDkgCommitReq      `json:"FrostReshareCommit,omitempty"`
+	FrostReshareAbort    *frostSessionReq        `json:"FrostReshareAbort,omitempty"`
+	FrostReshareFinalize *handleReq              `json:"FrostReshareFinalize,omitempty"`
+	FrostReshareRollback *handleReq              `json:"FrostReshareRollback,omitempty"`
 }
 
 // MarshalJSON: ListKeys is a unit variant — encode as the bare string
@@ -700,6 +719,14 @@ type vaultResponse struct {
 	FrostSignatureShare *struct {
 		Share []byte `json:"share"`
 	} `json:"FrostSignatureShare,omitempty"`
+	FrostReshareTarget *struct {
+		DhPublic []byte `json:"dh_public"`
+		Quote    []byte `json:"quote"`
+	} `json:"FrostReshareTarget,omitempty"`
+	FrostReshareDealt *struct {
+		Commitment [][]byte         `json:"commitment"`
+		Sealed     map[uint16][]byte `json:"sealed"`
+	} `json:"FrostReshareDealt,omitempty"`
 	FrostDone *struct{} `json:"FrostDone,omitempty"`
 
 	Error *string `json:"Error,omitempty"`
