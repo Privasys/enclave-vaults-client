@@ -567,3 +567,18 @@ func (c *Client) GetVaultIdentity(ctx context.Context) (VaultIdentity, error) {
 	}
 	return *id, nil
 }
+
+// bindingMembers is the "binding" a request carries for a binding v2
+// approval: the sorted member set the vault rebuilds the text from.
+type bindingMembers struct {
+	Members []string `json:"members"`
+}
+
+func (c *Client) bindingMembers() *bindingMembers {
+	if len(c.opts.BindingMembers) == 0 {
+		return nil
+	}
+	m := append([]string(nil), c.opts.BindingMembers...)
+	sort.Strings(m)
+	return &bindingMembers{Members: m}
+}

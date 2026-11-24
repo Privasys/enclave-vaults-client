@@ -583,12 +583,14 @@ type handleReq struct {
 type handleApprovalsReq struct {
 	Handle    string          `json:"handle"`
 	Approvals []ApprovalToken `json:"approvals,omitempty"`
+	Binding   *bindingMembers `json:"binding,omitempty"`
 }
 
 type updatePolicyReq struct {
 	Handle    string          `json:"handle"`
 	NewPolicy KeyPolicy       `json:"new_policy"`
 	Approvals []ApprovalToken `json:"approvals,omitempty"`
+	Binding   *bindingMembers `json:"binding,omitempty"`
 }
 
 type wrapReq struct {
@@ -636,11 +638,13 @@ type promotePendingProfileReq struct {
 	Handle    string          `json:"handle"`
 	PendingID uint32          `json:"pending_id"`
 	Approvals []ApprovalToken `json:"approvals,omitempty"`
+	Binding   *bindingMembers `json:"binding,omitempty"`
 }
 
 type revokePendingProfileReq struct {
-	Handle    string `json:"handle"`
-	PendingID uint32 `json:"pending_id"`
+	Handle    string          `json:"handle"`
+	PendingID uint32          `json:"pending_id"`
+	Binding   *bindingMembers `json:"binding,omitempty"`
 }
 
 // vaultResponse is the externally-tagged response envelope.
@@ -736,7 +740,7 @@ type vaultResponse struct {
 		Quote    []byte `json:"quote"`
 	} `json:"FrostReshareTarget,omitempty"`
 	FrostReshareDealt *struct {
-		Commitment [][]byte         `json:"commitment"`
+		Commitment [][]byte          `json:"commitment"`
 		Sealed     map[uint16][]byte `json:"sealed"`
 	} `json:"FrostReshareDealt,omitempty"`
 	FrostDone *struct{} `json:"FrostDone,omitempty"`
@@ -823,6 +827,12 @@ type DialOptions struct {
 	// Attestation selects what to ask the vault for after the handshake;
 	// the zero value is challenge mode (Level 3 binding).
 	Attestation ratls.AttestationMode
+
+	// BindingMembers is the member set of a binding v2 approval. When set, every
+	// approval-gated request (export, delete, policy update, promote, revoke of
+	// a pending profile) carries it as "binding":{"members":[...]}, sorted, and
+	// each vault rebuilds the approval's text from it and its own state.
+	BindingMembers []string
 }
 
 // Client is an authenticated session against a single vault instance.
@@ -925,7 +935,7 @@ func (c *Client) CreateKey(ctx context.Context, handle string,
 // and the policy grants ExportKey to the caller).
 func (c *Client) ExportKey(ctx context.Context, handle string, approvals ...ApprovalToken) ([]byte, error) {
 	resp, err := c.call(ctx, vaultRequest{ExportKey: &handleApprovalsReq{
-		Handle: handle, Approvals: approvals,
+		Handle: handle, Approvals: approvals, Binding: c.bindingMembers(),
 	}})
 	if err != nil {
 		return nil, err
@@ -939,7 +949,7 @@ func (c *Client) ExportKey(ctx context.Context, handle string, approvals ...Appr
 // DeleteKey removes a key and its policy.
 func (c *Client) DeleteKey(ctx context.Context, handle string, approvals ...ApprovalToken) error {
 	resp, err := c.call(ctx, vaultRequest{DeleteKey: &handleApprovalsReq{
-		Handle: handle, Approvals: approvals,
+		Handle: handle, Approvals: approvals, Binding: c.bindingMembers(),
 	}})
 	if err != nil {
 		return err
@@ -954,7 +964,7 @@ func (c *Client) DeleteKey(ctx context.Context, handle string, approvals ...Appr
 func (c *Client) UpdatePolicy(ctx context.Context, handle string, newPolicy KeyPolicy,
 	approvals ...ApprovalToken) (uint32, error) {
 	resp, err := c.call(ctx, vaultRequest{UpdatePolicy: &updatePolicyReq{
-		Handle: handle, NewPolicy: newPolicy, Approvals: approvals,
+		Handle: handle, NewPolicy: newPolicy, Approvals: approvals, Binding: c.bindingMembers(),
 	}})
 	if err != nil {
 		return 0, err
@@ -1189,7 +1199,7 @@ func (c *Client) ListPendingProfiles(ctx context.Context, handle string) ([]Pend
 func (c *Client) PromotePendingProfile(ctx context.Context, handle string,
 	pendingID uint32, approvals ...ApprovalToken) (uint32, error) {
 	resp, err := c.call(ctx, vaultRequest{PromotePendingProfile: &promotePendingProfileReq{
-		Handle: handle, PendingID: pendingID, Approvals: approvals,
+		Handle: handle, PendingID: pendingID, Approvals: approvals, Binding: c.bindingMembers(),
 	}})
 	if err != nil {
 		return 0, err
@@ -1204,7 +1214,7 @@ func (c *Client) PromotePendingProfile(ctx context.Context, handle string,
 func (c *Client) RevokePendingProfile(ctx context.Context, handle string,
 	pendingID uint32) error {
 	resp, err := c.call(ctx, vaultRequest{RevokePendingProfile: &revokePendingProfileReq{
-		Handle: handle, PendingID: pendingID,
+		Handle: handle, PendingID: pendingID, Binding: c.bindingMembers(),
 	}})
 	if err != nil {
 		return err

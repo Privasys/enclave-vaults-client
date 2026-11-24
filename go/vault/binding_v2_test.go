@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -232,5 +233,21 @@ func TestDeleteAfterTarget(t *testing.T) {
 	}
 	if BindDeleteAfter.MaxTTLSeconds() != 86400 || BindDelete.MaxTTLSeconds() != 600 {
 		t.Fatal("ttl per op")
+	}
+}
+
+func TestApprovalRequestsCarryTheBindingMembers(t *testing.T) {
+	c := &Client{opts: DialOptions{BindingMembers: []string{memberA, memberB}}}
+	raw, err := json.Marshal(vaultRequest{DeleteKey: &handleApprovalsReq{Handle: "h", Binding: c.bindingMembers()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"DeleteKey":{"handle":"h","binding":{"members":["` + memberB + `","` + memberA + `"]}}}`
+	if string(raw) != want {
+		t.Fatalf("got  %s\nwant %s", raw, want)
+	}
+	plain, _ := json.Marshal(vaultRequest{DeleteKey: &handleApprovalsReq{Handle: "h", Binding: (&Client{}).bindingMembers()}})
+	if strings.Contains(string(plain), "binding") {
+		t.Fatalf("a v1 request carries a binding: %s", plain)
 	}
 }
