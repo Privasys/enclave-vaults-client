@@ -35,12 +35,14 @@ Each `Client` instance is a single RA-TLS session to one vault. All operations a
 | `ListKeys`              | List handles visible to the caller                                                   | OIDC                                |
 | `GetKeyInfo`            | Metadata + public components only (no sealed material)                               | OIDC or attested TEE                |
 | `Wrap` / `Unwrap`       | AES-256-GCM with sealed KEK; AAD + IV verbatim                                       | Attested TEE (RA-TLS) or OIDC       |
-| `Sign` / `Verify`       | P-256 / Ed25519, hash inside the enclave                                             | Attested TEE or OIDC                |
+| `Sign`                  | ECDSA P-256, hash inside the enclave (or a pre-computed digest)                      | Attested TEE or OIDC                |
 | `Mac`                   | HMAC-SHA-256                                                                         | Attested TEE or OIDC                |
 | `UpdatePolicy`          | Diff-style policy update; respects `Mutability` and may need approval tokens         | OIDC + manager approvals            |
 | `GetPolicy`             | Returns the current policy + `policy_version`                                        | OIDC or attested TEE                |
 | `IssueApprovalToken`    | Manager mints a short-lived approval blob for a specific `(handle, op)`              | Manager OIDC (or FIDO2 in the wallet) |
 | `ReadAuditLog`          | Sealed append-only log; one entry per attempted op                                   | OIDC owner / auditor                |
+
+Threshold Ed25519 keys (FROST, RFC 9591) are client-orchestrated across the constellation: `Constellation.CreateThresholdKey` runs the distributed key generation, `Constellation.SignThreshold` collects a threshold of the vaults' signature shares into one EdDSA signature, and `ReshareThresholdKey` renews a key onto new vaults under the same handle and public key (`ReshareContext` is the digest the owner's wallet approval binds). No vault, and not the client, ever holds the key.
 
 Pending-profile lifecycle (used during enclave upgrades) lives on the same `Client`:
 
@@ -48,7 +50,7 @@ Pending-profile lifecycle (used during enclave upgrades) lives on the same `Clie
 
 ## OIDC
 
-By default the SDK accepts JWTs from **Privasys ID** (`https://privasys.id`, audience `privasys-platform`, JWKS at `https://privasys.id/jwks`). Roles are matched as raw strings on `claims.roles`:
+By default the SDK works with JWTs from **Privasys ID** (`https://privasys.id`, JWKS at `https://privasys.id/jwks`). Each constellation's vaults accept one audience (Privasys production: `privasys-platform`; the test platform: `privasys-platform-test`), which the directory reports as `oidc_audience`: pass a token of that audience. Roles are matched as raw strings on `claims.roles`:
 
 - `vault:owner` — create / delete / rotate / export their own keys
 - `vault:manager` — co-sign approvals (export, policy changes, profile promotions)
