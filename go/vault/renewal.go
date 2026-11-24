@@ -85,10 +85,10 @@ type Renewal struct {
 }
 
 // CapabilityGenerations is listed in VaultIdentity.Capabilities by a vault
-// build that reports KeyInfo.RenewedInPlaceFrom, refuses a first creation of
-// "<name>/v<n>" for n >= 2, and keeps a carried key's exportable flag and type
-// (formats §9.1). Trust a generation link only from such a build, over a
-// connection pinned to it.
+// build that reports KeyInfo.RenewedInPlaceFrom, refuses a first creation of a
+// generation handle (last segment "gen-<n>"), and keeps a carried key's
+// exportable flag and type (formats §9.1). Trust a generation link only from
+// such a build, over a connection pinned to it.
 const CapabilityGenerations = "generations-v1"
 
 type renewalCreateKeyReq struct {
