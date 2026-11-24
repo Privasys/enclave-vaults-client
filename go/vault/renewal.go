@@ -269,3 +269,38 @@ func (c *Client) callRaw(ctx context.Context, payload []byte) (*vaultResponse, e
 	}
 	return resp, resp.errorOr()
 }
+
+// CanonicalisePolicy asks the vault for its verdict on a policy without
+// storing anything (formats §5.1): the digest it would bind, or its refusal (a
+// field it does not know, a value its normalisation would change). A binding
+// v2 client calls it before asking the owner to approve a policy, so a policy
+// the vault would refuse fails before the tap, not after. Unauthenticated.
+func (c *Client) CanonicalisePolicy(ctx context.Context, policy json.RawMessage) (string, error) {
+	if !json.Valid(policy) {
+		return "", errors.New("canonicalise policy: not valid JSON")
+	}
+	body, err := json.Marshal(map[string]any{"CanonicalisePolicy": map[string]json.RawMessage{"policy": policy}})
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+	raw, err := c.sendRaw(ctx, body)
+	if err != nil {
+		return "", err
+	}
+	var env struct {
+		CanonicalPolicy *struct {
+			PD string `json:"pd"`
+		} `json:"CanonicalPolicy"`
+		Error *string `json:"Error"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+	if env.Error != nil {
+		return "", &ErrVaultError{Message: *env.Error}
+	}
+	if env.CanonicalPolicy == nil || env.CanonicalPolicy.PD == "" {
+		return "", ErrUnexpectedResponse
+	}
+	return env.CanonicalPolicy.PD, nil
+}

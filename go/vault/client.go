@@ -1285,6 +1285,10 @@ type EndpointResult struct {
 	Pending       []PendingProfile
 	Material      []byte
 	Policy        *KeyPolicy
+	// RawPolicy is set by GetPolicyRaw (the policy as the vault serialised
+	// it); PD by CanonicalisePolicy (the digest the vault would bind).
+	RawPolicy json.RawMessage
+	PD        string
 	// AutoPromoted is set by Stage: the vault accepted the profile without
 	// an owner promote (auto-migrate opt-in matched a runtime-only delta,
 	// or the profile was already an accepted principal). PendingID is
@@ -1451,6 +1455,24 @@ func (con *Constellation) UpdatePolicyRaw(ctx context.Context, handle string,
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
 		ver, err := c.UpdatePolicyRaw(ctx, handle, newPolicy, approvals...)
 		return EndpointResult{PolicyVersion: ver}, err
+	})
+}
+
+// GetPolicyRaw reads the key's policy as each vault serialised it (see
+// Client.GetPolicyRaw), with its version.
+func (con *Constellation) GetPolicyRaw(ctx context.Context, handle string) ([]EndpointResult, error) {
+	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
+		raw, ver, err := c.GetPolicyRaw(ctx, handle)
+		return EndpointResult{RawPolicy: raw, PolicyVersion: ver}, err
+	})
+}
+
+// CanonicalisePolicy asks every vault for its verdict on a policy (see
+// Client.CanonicalisePolicy).
+func (con *Constellation) CanonicalisePolicy(ctx context.Context, policy json.RawMessage) ([]EndpointResult, error) {
+	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
+		pd, err := c.CanonicalisePolicy(ctx, policy)
+		return EndpointResult{PD: pd}, err
 	})
 }
 
