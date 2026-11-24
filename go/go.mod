@@ -5,7 +5,10 @@ module github.com/Privasys/enclave-vaults-client/go
 
 go 1.22
 
-require enclave-os-mini/clients/go v0.0.0
+require (
+	enclave-os-mini/clients/go v0.0.0
+	golang.org/x/crypto v0.31.0
+)
 
 // For local development, point to sibling checkout of ra-tls-clients.
 // In CI / consumers, replace with a tagged version or git commit hash:

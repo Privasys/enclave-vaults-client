@@ -878,42 +878,7 @@ func (c *Client) call(ctx context.Context, req vaultRequest) (*vaultResponse, er
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
-
-	var token string
-	if c.opts.AuthToken != nil {
-		token, err = c.opts.AuthToken.Token(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("auth token: %w", err)
-		}
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.conn == nil {
-		if err := c.reconnect(ctx); err != nil {
-			return nil, err
-		}
-	}
-
-	body, err := c.conn.SendData(payload, token)
-	if err != nil {
-		// Retry once on connection error.
-		_ = c.conn.Close()
-		c.conn = nil
-		if err2 := c.reconnect(ctx); err2 != nil {
-			return nil, fmt.Errorf("send (retry dial): %w", err2)
-		}
-		body, err = c.conn.SendData(payload, token)
-		if err != nil {
-			return nil, fmt.Errorf("send: %w", err)
-		}
-	}
-
-	resp, err := unmarshalResponse(body)
-	if err != nil {
-		return nil, fmt.Errorf("decode response: %w; raw=%s", err, truncate(body, 256))
-	}
-	return resp, resp.errorOr()
+	return c.callRaw(ctx, payload)
 }
 
 func truncate(b []byte, n int) string {
