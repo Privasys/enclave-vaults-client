@@ -17,11 +17,13 @@ package vault
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"fmt"
 	"math/big"
 	"sort"
@@ -173,13 +175,44 @@ func orDash(s string) string {
 // fractional numbers, so any number that is not an integer within ±2^53 is
 // refused rather than given an encoding the other implementations might not
 // share.
+// A policy's member names are also ASCII, as the vault requires.
 func PolicyDigestJSON(policy []byte) (string, error) {
-	c, err := CanonicalJSON(policy)
+	v, err := parseStrictJSON(policy)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(c)
+	if err := asciiNames(v); err != nil {
+		return "", err
+	}
+	var c bytes.Buffer
+	if err := writeJCS(&c, v); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(c.Bytes())
 	return hex.EncodeToString(sum[:]), nil
+}
+
+func asciiNames(v interface{}) error {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		for k, e := range t {
+			for i := 0; i < len(k); i++ {
+				if k[i] >= 0x80 {
+					return fmt.Errorf("policy: member name %q is not ASCII", k)
+				}
+			}
+			if err := asciiNames(e); err != nil {
+				return err
+			}
+		}
+	case []interface{}:
+		for _, e := range t {
+			if err := asciiNames(e); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // PolicyDigest is PD of a policy as this client sends it.
@@ -194,20 +227,30 @@ func PolicyDigest(p KeyPolicy) (string, error) {
 // CanonicalJSON is the RFC 8785 form of a JSON document whose numbers are all
 // integers within ±2^53.
 func CanonicalJSON(doc []byte) ([]byte, error) {
-	dec := json.NewDecoder(bytes.NewReader(doc))
-	dec.UseNumber()
-	v, err := readJSONValue(dec)
+	v, err := parseStrictJSON(doc)
 	if err != nil {
-		return nil, fmt.Errorf("canonical json: %w", err)
-	}
-	if _, err := dec.Token(); err == nil {
-		return nil, errors.New("canonical json: trailing data")
+		return nil, err
 	}
 	var out bytes.Buffer
 	if err := writeJCS(&out, v); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil
+}
+
+// parseStrictJSON reads exactly one JSON value, with nothing after it but
+// whitespace.
+func parseStrictJSON(doc []byte) (interface{}, error) {
+	dec := json.NewDecoder(bytes.NewReader(doc))
+	dec.UseNumber()
+	v, err := readJSONValue(dec)
+	if err != nil {
+		return nil, fmt.Errorf("canonical json: %w", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("canonical json: trailing data")
+	}
+	return v, nil
 }
 
 // readJSONValue decodes one value and refuses an object that names a member
@@ -381,4 +424,78 @@ func utf16Less(a, b string) bool {
 		}
 	}
 	return len(ua) < len(ub)
+}
+
+// ===========================================================================
+//  A vault's identity
+// ===========================================================================
+
+// VaultIdentity is what GetVaultIdentity returns: the vault's member key, its
+// billing configuration, and an SGX quote binding the two.
+type VaultIdentity struct {
+	MemberID        string `json:"member_id"`
+	MemberPublicKey string `json:"member_public_key"` // hex, SEC1 uncompressed
+	BillingID       string `json:"billing_id"`
+	MRENCLAVE       string `json:"mrenclave"` // hex
+	QuoteB64        string `json:"quote_b64"` // base64url, no padding
+}
+
+// Offsets in an SGX DCAP quote (v3 or v4): a 48-byte header, then the report
+// body, whose MRENCLAVE is at 64 and report data at 320.
+const (
+	sgxQuoteMrEnclave  = 48 + 64
+	sgxQuoteReportData = 48 + 320
+)
+
+// Check verifies the identity is self-consistent: member_id is the hash of the
+// member key, and the quote carries that member id, the billing id and the
+// MRENCLAVE in its report.
+//
+// It does not verify the quote's signature chain. A client that asked for the
+// identity over the vault's own RA-TLS connection has already attested that
+// enclave; the quote is for whoever receives the identity relayed (the wallet),
+// who verifies it against the published vault releases.
+func (id VaultIdentity) Check() error {
+	pub, err := hex.DecodeString(id.MemberPublicKey)
+	if err != nil {
+		return errors.New("vault identity: the member key is not hex")
+	}
+	want, err := MemberID(pub)
+	if err != nil {
+		return fmt.Errorf("vault identity: %w", err)
+	}
+	if id.MemberID != want {
+		return errors.New("vault identity: member_id is not the hash of the member key")
+	}
+	quote, err := base64.RawURLEncoding.DecodeString(id.QuoteB64)
+	if err != nil {
+		return errors.New("vault identity: the quote is not base64url")
+	}
+	if len(quote) < sgxQuoteReportData+64 {
+		return errors.New("vault identity: the quote is too short")
+	}
+	rd := IdentityReportData(id.MemberID, id.BillingID)
+	if !bytes.Equal(quote[sgxQuoteReportData:sgxQuoteReportData+32], rd[:]) {
+		return errors.New("vault identity: the quote does not carry this member id and billing id")
+	}
+	if hex.EncodeToString(quote[sgxQuoteMrEnclave:sgxQuoteMrEnclave+32]) != strings.ToLower(id.MRENCLAVE) {
+		return errors.New("vault identity: the quote is from another MRENCLAVE")
+	}
+	return nil
+}
+
+// GetVaultIdentity reads the vault's identity and checks it is
+// self-consistent. Unauthenticated at the vault.
+func (c *Client) GetVaultIdentity(ctx context.Context) (VaultIdentity, error) {
+	resp, err := c.call(ctx, vaultRequest{GetVaultIdentity: true})
+	if err != nil {
+		return VaultIdentity{}, err
+	}
+	if resp.VaultIdentity == nil {
+		return VaultIdentity{}, ErrUnexpectedResponse
+	}
+	if err := resp.VaultIdentity.Check(); err != nil {
+		return VaultIdentity{}, err
+	}
+	return *resp.VaultIdentity, nil
 }

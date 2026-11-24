@@ -111,7 +111,7 @@ func TestCanonicalJSON(t *testing.T) {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
 
-	for _, bad := range []string{`{"a":1,"a":2}`, `{"a":1.5}`, `{"a":9007199254740993}`, `{"a":1} {}`, `{"a":"\xff"}`} {
+	for _, bad := range []string{`{"a":1,"a":2}`, `{"a":1.5}`, `{"a":9007199254740993}`, `{"a":1} {}`, `{"a":1} x`, `{"a":"\xff"}`} {
 		if _, err := CanonicalJSON([]byte(bad)); err == nil {
 			t.Errorf("accepted %s", bad)
 		}

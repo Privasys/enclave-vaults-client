@@ -515,7 +515,8 @@ type vaultRequest struct {
 	GetPolicy             *handleReq                `json:"GetPolicy,omitempty"`
 	GetKeyInfo            *handleReq                `json:"GetKeyInfo,omitempty"`
 	ListKeys              bool                      `json:"-"`
-	Wrap                  *wrapReq                  `json:"Wrap,omitempty"`
+	GetVaultIdentity      bool                      `json:"-"`
+	Wrap               *wrapReq                  `json:"Wrap,omitempty"`
 	Unwrap                *unwrapReq                `json:"Unwrap,omitempty"`
 	Sign                  *signOrMacReq             `json:"Sign,omitempty"`
 	Mac                   *signOrMacReq             `json:"Mac,omitempty"`
@@ -550,6 +551,9 @@ type vaultRequest struct {
 func (vr vaultRequest) MarshalJSON() ([]byte, error) {
 	if vr.ListKeys {
 		return []byte(`"ListKeys"`), nil
+	}
+	if vr.GetVaultIdentity {
+		return []byte(`"GetVaultIdentity"`), nil
 	}
 	type alias vaultRequest
 	return json.Marshal(alias(vr))
@@ -653,8 +657,9 @@ type vaultResponse struct {
 		Policy        KeyPolicy `json:"policy"`
 		PolicyVersion uint32    `json:"policy_version"`
 	} `json:"Policy,omitempty"`
-	KeyInfo *KeyInfo `json:"KeyInfo,omitempty"`
-	KeyList *struct {
+	KeyInfo       *KeyInfo       `json:"KeyInfo,omitempty"`
+	VaultIdentity *VaultIdentity `json:"VaultIdentity,omitempty"`
+	KeyList       *struct {
 		Keys []KeyListEntry `json:"keys"`
 	} `json:"KeyList,omitempty"`
 	Wrapped *struct {
