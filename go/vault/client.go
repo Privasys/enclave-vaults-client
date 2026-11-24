@@ -398,6 +398,10 @@ type OidcStepUpCond struct {
 	RequiredAmr     []string `json:"required_amr,omitempty"`
 	OperationBound  bool     `json:"operation_bound,omitempty"`
 	FreshForSeconds uint64   `json:"fresh_for_seconds,omitempty"`
+	// Binding is 2 for binding v2 (wallet-signed-authority-wire-formats.md
+	// §5): the vault then takes only a v2 vault_op for this rule. Absent (0)
+	// on every key created before v2, which takes v1 only.
+	Binding uint8 `json:"binding,omitempty"`
 }
 
 // ManagerApprovalCond requires a fresh approval token from a manager.
@@ -444,6 +448,9 @@ type KeyPolicy struct {
 	Operations []OperationRule `json:"operations"`
 	Mutability Mutability      `json:"mutability,omitempty"`
 	Lifecycle  Lifecycle       `json:"lifecycle,omitempty"`
+	// Approval "none" opts a key out of approval by default (formats §4);
+	// empty on every other key.
+	Approval string `json:"approval,omitempty"`
 }
 
 // ApprovalToken carries a JWT issued by IssueApprovalToken.
