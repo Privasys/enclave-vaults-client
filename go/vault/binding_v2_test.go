@@ -209,3 +209,28 @@ func TestGetVaultIdentityNeedsPinnedMRENCLAVE(t *testing.T) {
 		t.Fatalf("an unpinned connection was used: %v", err)
 	}
 }
+
+func TestDeleteAfterTarget(t *testing.T) {
+	got, err := DeleteAfterTarget("apps.privasys.org/new/k", strings.Repeat("e", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("privasys-delete-after-v1\napps.privasys.org/new/k\n" + strings.Repeat("e", 64)))
+	if got != hex.EncodeToString(sum[:]) {
+		t.Fatal("delete_after target")
+	}
+	created, _ := DeleteAfterTarget("apps.privasys.org/new/k", "")
+	sum = sha256.Sum256([]byte("privasys-delete-after-v1\napps.privasys.org/new/k\n-"))
+	if created != hex.EncodeToString(sum[:]) {
+		t.Fatal("a created successor's target is not '-'")
+	}
+	if _, err := DeleteAfterTarget("", "x"); err == nil {
+		t.Fatal("no successor accepted")
+	}
+	if _, err := DeleteAfterTarget("a\nb", ""); err == nil {
+		t.Fatal("a line break accepted")
+	}
+	if BindDeleteAfter.MaxTTLSeconds() != 86400 || BindDelete.MaxTTLSeconds() != 600 {
+		t.Fatal("ttl per op")
+	}
+}

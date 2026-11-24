@@ -41,7 +41,38 @@ const (
 
 	// BindingMaxTTLSeconds is the furthest ahead a binding's exp may be.
 	BindingMaxTTLSeconds = 600
+	// DeleteAfterMaxTTLSeconds is the exception for delete_after, which is
+	// held until a migration or upgrade has finished.
+	DeleteAfterMaxTTLSeconds = 86400
 )
+
+// MaxTTLSeconds is the furthest ahead an approval for op may expire.
+func (o BindingOp) MaxTTLSeconds() int64 {
+	if o == BindDeleteAfter {
+		return DeleteAfterMaxTTLSeconds
+	}
+	return BindingMaxTTLSeconds
+}
+
+// DeleteAfterTarget is the target of a delete_after: the old key may be
+// deleted only after this successor, and (for a promote) only after that
+// promote. successorTarget is the successor's promote target (its profile
+// digest), or "" when the successor is created.
+func DeleteAfterTarget(successorHandle, successorTarget string) (string, error) {
+	if successorHandle == "" || strings.ContainsAny(successorHandle+successorTarget, "\n\r") {
+		return "", errors.New("delete_after: a successor handle without line breaks is required")
+	}
+	sum := sha256.Sum256([]byte("privasys-delete-after-v1\n" + successorHandle + "\n" + orDash(successorTarget)))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// ImplicitBillingID is a step 1 vault's billing id, before billing
+// configurations exist: hex SHA-256 of "privasys-billing-implicit-v0\n" iss
+// "\n" aud, from the vault's one issuer and audience.
+func ImplicitBillingID(issuer, audience string) string {
+	sum := sha256.Sum256([]byte("privasys-billing-implicit-v0\n" + issuer + "\n" + audience))
+	return hex.EncodeToString(sum[:])
+}
 
 // BindingOp is the operation a v2 binding approves.
 type BindingOp string
@@ -58,12 +89,16 @@ const (
 	BindDelete          BindingOp = "delete"
 	BindReshare         BindingOp = "reshare"
 	BindRevokePending   BindingOp = "revoke_pending"
+	// BindDeleteAfter deletes the old key of a migration or upgrade, approved
+	// in the same tap as its successor's promote or creation (DeleteAfterTarget).
+	BindDeleteAfter BindingOp = "delete_after"
 )
 
 func (o BindingOp) valid() bool {
 	switch o {
 	case BindCreate, BindPromote, BindExport, BindExportAssembled, BindIssuerCreate,
-		BindIssuerUpdate, BindIssuerDelete, BindUpdatePolicy, BindDelete, BindReshare, BindRevokePending:
+		BindIssuerUpdate, BindIssuerDelete, BindUpdatePolicy, BindDelete, BindReshare, BindRevokePending,
+		BindDeleteAfter:
 		return true
 	}
 	return false
