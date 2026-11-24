@@ -281,3 +281,18 @@ func TestUpdatePolicyRawSendsThePolicyAsGiven(t *testing.T) {
 		t.Fatalf("digest changed on the wire: %s -> %s", a, b)
 	}
 }
+
+func TestDeleteKeyAfterNamesItsSuccessor(t *testing.T) {
+	c := &Client{opts: DialOptions{BindingMembers: []string{memberA}}}
+	raw, err := c.deleteKeyAfterPayload("apps/x/v1", "apps/x/v2", "-", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"DeleteKey":{"handle":"apps/x/v1","binding":{"members":["` + memberA + `"]},"after":{"successor":"apps/x/v2","successor_target":"-"}}}`
+	if string(raw) != want {
+		t.Fatalf("got  %s\nwant %s", raw, want)
+	}
+	if err := c.DeleteKeyAfter(context.Background(), "apps/x/v1", "apps/x/v1", "-"); err == nil {
+		t.Fatal("a key was accepted as its own successor")
+	}
+}

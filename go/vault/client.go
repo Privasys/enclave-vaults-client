@@ -987,6 +987,48 @@ func (c *Client) UpdatePolicy(ctx context.Context, handle string, newPolicy KeyP
 	return resp.PolicyUpdated.PolicyVersion, nil
 }
 
+// DeleteKeyAfter deletes the old key of a migration, a rotation or an
+// upgrade under a delete_after approval (binding v2, formats §9.2): the
+// request names the successor, and successorTarget is the successor's promote
+// target, or "-" when it was created rather than promoted. The vault
+// recomputes the bound target from them and refuses a successor equal to the
+// key.
+func (c *Client) DeleteKeyAfter(ctx context.Context, handle, successor, successorTarget string,
+	approvals ...ApprovalToken) error {
+	if successor == "" || successor == handle {
+		return errors.New("delete after: a successor other than the key is required")
+	}
+	if successorTarget == "" {
+		successorTarget = "-"
+	}
+	payload, err := c.deleteKeyAfterPayload(handle, successor, successorTarget, approvals)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.callRaw(ctx, payload)
+	if err != nil {
+		return err
+	}
+	if resp.KeyDeleted == nil {
+		return ErrUnexpectedResponse
+	}
+	return nil
+}
+
+type deleteAfter struct {
+	Successor       string `json:"successor"`
+	SuccessorTarget string `json:"successor_target"`
+}
+
+func (c *Client) deleteKeyAfterPayload(handle, successor, successorTarget string, approvals []ApprovalToken) ([]byte, error) {
+	return json.Marshal(map[string]any{"DeleteKey": struct {
+		Handle    string          `json:"handle"`
+		Approvals []ApprovalToken `json:"approvals,omitempty"`
+		Binding   *bindingMembers `json:"binding,omitempty"`
+		After     deleteAfter     `json:"after"`
+	}{handle, approvals, c.bindingMembers(), deleteAfter{successor, successorTarget}}})
+}
+
 // UpdatePolicyRaw replaces the policy on an existing key with newPolicy as
 // given, never re-serialised: a binding v2 update_policy approval binds the
 // digest of the policy JSON the owner was shown (PD, binding v2 §5.1), so the
@@ -1473,6 +1515,14 @@ func (con *Constellation) CanonicalisePolicy(ctx context.Context, policy json.Ra
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
 		pd, err := c.CanonicalisePolicy(ctx, policy)
 		return EndpointResult{PD: pd}, err
+	})
+}
+
+// DeleteKeyAfter fans DeleteKeyAfter out to every live vault.
+func (con *Constellation) DeleteKeyAfter(ctx context.Context, handle, successor, successorTarget string,
+	approvals ...ApprovalToken) ([]EndpointResult, error) {
+	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
+		return EndpointResult{}, c.DeleteKeyAfter(ctx, handle, successor, successorTarget, approvals...)
 	})
 }
 
