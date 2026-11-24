@@ -276,31 +276,42 @@ func (c *Client) callRaw(ctx context.Context, payload []byte) (*vaultResponse, e
 // v2 client calls it before asking the owner to approve a policy, so a policy
 // the vault would refuse fails before the tap, not after. Unauthenticated.
 func (c *Client) CanonicalisePolicy(ctx context.Context, policy json.RawMessage) (string, error) {
+	_, pd, err := c.CanonicalPolicy(ctx, policy)
+	return pd, err
+}
+
+// CanonicalPolicy is CanonicalisePolicy returning also the policy as the vault
+// would store it, every field written (as GetPolicy returns a stored one). A
+// client that rebuilt a policy from a typed form compares this with the stored
+// policy to know nothing was dropped: the typed form may leave out fields at
+// their default, which the vault writes back.
+func (c *Client) CanonicalPolicy(ctx context.Context, policy json.RawMessage) (json.RawMessage, string, error) {
 	if !json.Valid(policy) {
-		return "", errors.New("canonicalise policy: not valid JSON")
+		return nil, "", errors.New("canonicalise policy: not valid JSON")
 	}
 	body, err := json.Marshal(map[string]any{"CanonicalisePolicy": map[string]json.RawMessage{"policy": policy}})
 	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", err)
+		return nil, "", fmt.Errorf("marshal request: %w", err)
 	}
 	raw, err := c.sendRaw(ctx, body)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
 	var env struct {
 		CanonicalPolicy *struct {
-			PD string `json:"pd"`
+			Policy json.RawMessage `json:"policy"`
+			PD     string          `json:"pd"`
 		} `json:"CanonicalPolicy"`
 		Error *string `json:"Error"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
+		return nil, "", fmt.Errorf("decode response: %w", err)
 	}
 	if env.Error != nil {
-		return "", &ErrVaultError{Message: *env.Error}
+		return nil, "", &ErrVaultError{Message: *env.Error}
 	}
-	if env.CanonicalPolicy == nil || env.CanonicalPolicy.PD == "" {
-		return "", ErrUnexpectedResponse
+	if env.CanonicalPolicy == nil || env.CanonicalPolicy.PD == "" || len(env.CanonicalPolicy.Policy) == 0 {
+		return nil, "", ErrUnexpectedResponse
 	}
-	return env.CanonicalPolicy.PD, nil
+	return env.CanonicalPolicy.Policy, env.CanonicalPolicy.PD, nil
 }

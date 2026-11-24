@@ -1367,6 +1367,7 @@ type EndpointResult struct {
 	Material      []byte
 	Policy        *KeyPolicy
 	// RawPolicy is set by GetPolicyRaw (the policy as the vault serialised
+	// it) and by CanonicalisePolicy (the policy as the vault would store
 	// it); PD by CanonicalisePolicy (the digest the vault would bind).
 	RawPolicy json.RawMessage
 	PD        string
@@ -1562,8 +1563,8 @@ func (con *Constellation) GetPolicyRaw(ctx context.Context, handle string) ([]En
 // Client.CanonicalisePolicy).
 func (con *Constellation) CanonicalisePolicy(ctx context.Context, policy json.RawMessage) ([]EndpointResult, error) {
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
-		pd, err := c.CanonicalisePolicy(ctx, policy)
-		return EndpointResult{PD: pd}, err
+		canonical, pd, err := c.CanonicalPolicy(ctx, policy)
+		return EndpointResult{RawPolicy: canonical, PD: pd}, err
 	})
 }
 
