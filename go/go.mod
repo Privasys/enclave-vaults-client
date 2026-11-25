@@ -10,6 +10,8 @@ require (
 	golang.org/x/crypto v0.31.0
 )
 
+require golang.org/x/sys v0.28.0 // indirect
+
 // For local development, point to sibling checkout of ra-tls-clients.
 // In CI / consumers, replace with a tagged version or git commit hash:
 //   require github.com/Privasys/ra-tls-clients/go v0.2.0

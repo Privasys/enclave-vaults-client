@@ -18,29 +18,29 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   GOPROXY: "https://proxy.golang.org,direct"
   GOSUMDB: "sum.golang.org"
-  # The module carries no go.sum: let the build record sums, each checked
-  # against sum.golang.org.
-  GOFLAGS: "-mod=mod"
+  # go.sum is committed: a dependency cannot change without a diff.
+  GOFLAGS: "-mod=readonly"
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout enclave-vaults-client
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           path: enclave-vaults-client
 
       - name: Checkout ra-tls-clients (sibling for the go.mod replace)
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: Privasys/ra-tls-clients
-          # The version the CLI's release builds this client with.
-          ref: v0.12.0
+          # v0.12.0, the version the CLI's release builds this client with,
+          # pinned by commit (a tag can be moved).
+          ref: d02eda735d1d372565b5f9549ad166e642e7bbf9
           path: ra-tls-clients
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: enclave-vaults-client/go/go.mod
 
