@@ -1,0 +1,71 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0.
+#
+# Builds and publishes the vaultprobe command (go/cmd/vaultprobe) on a
+# vaultprobe-v* tag: the client tests, then Windows and Linux binaries with
+# SHA-256 sums, attached to a GitHub release. Built by CI only.
+name: vaultprobe
+
+on:
+  push:
+    tags:
+      - "vaultprobe-v*"
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  GOPROXY: "https://proxy.golang.org,direct"
+  GOSUMDB: "sum.golang.org"
+  # The module carries no go.sum: let the build record sums, each checked
+  # against sum.golang.org.
+  GOFLAGS: "-mod=mod"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout enclave-vaults-client
+        uses: actions/checkout@v5
+        with:
+          path: enclave-vaults-client
+
+      - name: Checkout ra-tls-clients (sibling for the go.mod replace)
+        uses: actions/checkout@v5
+        with:
+          repository: Privasys/ra-tls-clients
+          # The version the CLI's release builds this client with.
+          ref: v0.12.0
+          path: ra-tls-clients
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: enclave-vaults-client/go/go.mod
+
+      - name: Test
+        working-directory: enclave-vaults-client/go
+        run: go test ./...
+
+      - name: Build
+        working-directory: enclave-vaults-client/go
+        run: |
+          set -euo pipefail
+          mkdir -p ../../dist
+          for target in windows/amd64 linux/amd64; do
+            os=${target%/*}; arch=${target#*/}
+            ext=""; [ "$os" = windows ] && ext=".exe"
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w" \
+              -o "../../dist/vaultprobe-$os-$arch$ext" ./cmd/vaultprobe
+          done
+          cd ../../dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: enclave-vaults-client
+        run: |
+          gh release create "$GITHUB_REF_NAME" ../dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes "vaultprobe: per-member read-only vault reads and the stored-form refusal check (formats §5.1, §9.3). No sign-in code: bearers are read from stdin. Built by CI from ${GITHUB_SHA}."
