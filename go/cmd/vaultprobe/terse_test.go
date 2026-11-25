@@ -5,7 +5,9 @@ package main
 
 import (
 	"bufio"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -88,6 +90,18 @@ func TestRuleLinesPrintOnlyTheRules(t *testing.T) {
 	}
 	if _, err := ruleLines([]byte(`{"version":1}`)); err == nil {
 		t.Fatal("a policy without rules was accepted")
+	}
+}
+
+func TestExportVerdictNeverPrintsMaterial(t *testing.T) {
+	secret := []byte("0123456789abcdef-SECRET-MATERIAL")
+	v := exportVerdict(secret, nil)
+	if !strings.HasPrefix(v, "EXPORTED (sha256 of material: ") || strings.Contains(v, "SECRET") ||
+		strings.Contains(v, hex.EncodeToString(secret)) {
+		t.Fatalf("verdict leaks or is malformed: %s", v)
+	}
+	if v := exportVerdict(nil, errors.New("vault error: no OperationRule grants ExportKey")); v != "refused: vault error: no OperationRule grants ExportKey" {
+		t.Fatalf("got %s", v)
 	}
 }
 

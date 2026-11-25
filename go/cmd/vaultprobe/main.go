@@ -51,6 +51,10 @@ const notStoredForm = "new_policy is not in the vault's stored form"
 // showRules: print each key's operation rules (-rules).
 var showRules bool
 
+// The export proof (-export-proof): the key, the identity provider and the
+// audience the approval is issued for.
+var exportProofHandle, idpIssuer, vaultAudience string
+
 type handles []string
 
 func (h *handles) String() string     { return strings.Join(*h, ",") }
@@ -64,11 +68,15 @@ func main() {
 		tcb     = flag.String("tcb", "ConfigurationAndSWHardeningNeeded", "comma-separated acceptable TCB statuses")
 		refuse  = flag.String("refuse", "", "run the stored-form refusal check on this handle")
 		rules   = flag.Bool("rules", false, "also print each key's operation rules (ops, principal references, conditions)")
+		proof   = flag.String("export-proof", "", "ask ONE rules-change approval for this key and present it to ExportKey on each member; prints only refused or EXPORTED with a SHA-256")
+		issuer  = flag.String("issuer", "https://privasys.id", "identity provider (export proof only)")
+		aud     = flag.String("audience", "privasys-platform", "the vaults' bearer audience (export proof only)")
 		hs      handles
 	)
 	flag.Var(&hs, "handle", "a key handle to read (repeatable)")
 	flag.Parse()
 	showRules = *rules
+	exportProofHandle, idpIssuer, vaultAudience = *proof, *issuer, *aud
 	if err := run(*mre, *members, *attURL, *tcb, *refuse, hs); err != nil {
 		fmt.Fprintln(os.Stderr, "vaultprobe:", err)
 		os.Exit(1)
@@ -81,8 +89,8 @@ func run(mre, members, attURL, tcb, refuse string, hs []string) error {
 		return errors.New("-mrenclave must be 64 hex digits")
 	}
 	eps := splitList(members)
-	if len(eps) == 0 || (len(hs) == 0 && refuse == "") {
-		return errors.New("need -members and at least one -handle or -refuse")
+	if len(eps) == 0 || (len(hs) == 0 && refuse == "" && exportProofHandle == "") {
+		return errors.New("need -members and at least one -handle, -refuse or -export-proof")
 	}
 	owner, att, err := readBearers(bufio.NewReader(os.Stdin))
 	if err != nil {
@@ -99,9 +107,13 @@ func run(mre, members, attURL, tcb, refuse string, hs []string) error {
 			Endpoint: attURL, Token: att, AcceptableTCBStatuses: statuses,
 		},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	fmt.Println("vaultprobe at", time.Now().UTC().Format(time.RFC3339))
+	if exportProofHandle != "" {
+		// Alone: no other reads or checks in the same run.
+		return exportProof(ctx, eps, policy, owner, idpIssuer, vaultAudience, exportProofHandle)
+	}
 	failed := false
 	for _, ep := range eps {
 		c, err := vault.Dial(ctx, vault.VaultRegistration{ID: ep, Endpoint: ep, Status: "probe"},
