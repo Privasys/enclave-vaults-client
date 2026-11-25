@@ -42,6 +42,9 @@ type frostReshareTarget1Req struct {
 	Vaults                 []string `json:"vaults"`
 	Helpers                []uint16 `json:"helpers"`
 	OldPublicKeyPackageB64 string   `json:"old_public_key_package_b64"`
+	// The owner's create approval, for a re-created name new on this vault
+	// (formats §9.3.1).
+	Binding *bindingMembers `json:"binding,omitempty"`
 }
 
 type frostReshareDealReq struct {
@@ -248,6 +251,7 @@ func ReshareThresholdKey(ctx context.Context, p ReshareParams) (*ThresholdKey, e
 			Session: session, Handle: p.Handle, Grant: p.Grant, Index: uint16(i + 1),
 			Threshold: uint16(p.Threshold), Vaults: p.Target, Helpers: helperIdx,
 			OldPublicKeyPackageB64: pkpB64,
+			Binding:                c.createBinding(p.Handle),
 		}})
 		if err == nil && resp.FrostReshareTarget == nil {
 			err = ErrUnexpectedResponse
@@ -358,7 +362,9 @@ func ReshareThresholdKey(ctx context.Context, p ReshareParams) (*ThresholdKey, e
 			for _, cc := range committed {
 				if p.InPlace {
 					_, _ = cc.call(ctx, vaultRequest{FrostReshareRollback: &handleReq{Handle: p.Handle}})
-				} else if derr := cc.DeleteKey(ctx, p.Handle); derr != nil {
+				} else if aerr := cc.abortPending(ctx, "reshare", session, p.Handle); aerr != nil {
+					// The session undoes a pending copy with no tombstone, so
+					// a retry can use the same handle (formats §9.3.1).
 					undo = "partly undone: delete the new copies"
 				}
 			}

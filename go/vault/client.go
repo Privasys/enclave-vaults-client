@@ -486,6 +486,11 @@ type KeyInfo struct {
 	// (formats §9.1); empty for a first creation or a carried move. Trust it
 	// only from a vault whose identity lists CapabilityGenerations.
 	RenewedInPlaceFrom string `json:"renewed_in_place_from,omitempty"`
+	// CreatedByOwnerApproval: the vault created this key with its owner's
+	// bound create approval (formats §9.3.1). A client accepts a re-created
+	// name ("<name>/new-<k>") only when this is true on the pinned vaults,
+	// from vaults listing CapabilityTombstones.
+	CreatedByOwnerApproval bool `json:"created_by_owner_approval,omitempty"`
 }
 
 // ThresholdKeyInfo is what one vault holds of a threshold key (public).
@@ -578,6 +583,9 @@ type createKeyReq struct {
 	// IdP-issued key-creation grant (JWT) carrying owner, scope, key type,
 	// exportable flag and policy.
 	Grant string `json:"grant"`
+	// The owner's create approval, for a re-created name (formats §9.3.1):
+	// the bearer is the owner's step-up; this names the members.
+	Binding *bindingMembers `json:"binding,omitempty"`
 }
 
 type handleReq struct {
@@ -681,6 +689,7 @@ type vaultResponse struct {
 		PolicyVersion uint32    `json:"policy_version"`
 	} `json:"Policy,omitempty"`
 	KeyInfo       *KeyInfo       `json:"KeyInfo,omitempty"`
+	KeyTombstone  *KeyTombstone  `json:"KeyTombstone,omitempty"`
 	VaultIdentity *VaultIdentity `json:"VaultIdentity,omitempty"`
 	KeyList       *struct {
 		Keys []KeyListEntry `json:"keys"`
@@ -933,6 +942,7 @@ func (c *Client) CreateKey(ctx context.Context, handle string,
 		Handle:      handle,
 		MaterialB64: base64.RawURLEncoding.EncodeToString(material),
 		Grant:       grant,
+		Binding:     c.createBinding(handle),
 	}})
 	if err != nil {
 		return 0, err
@@ -1115,6 +1125,9 @@ func (c *Client) GetKeyInfo(ctx context.Context, handle string) (KeyInfo, error)
 	resp, err := c.call(ctx, vaultRequest{GetKeyInfo: &handleReq{Handle: handle}})
 	if err != nil {
 		return KeyInfo{}, err
+	}
+	if resp.KeyTombstone != nil {
+		return KeyInfo{}, &ErrKeyDeleted{Tombstone: *resp.KeyTombstone}
 	}
 	if resp.KeyInfo == nil {
 		return KeyInfo{}, ErrUnexpectedResponse

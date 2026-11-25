@@ -39,6 +39,8 @@ type frostDkgRound1Req struct {
 	Index     uint16   `json:"index"`
 	Threshold uint16   `json:"threshold"`
 	Vaults    []string `json:"vaults"`
+	// The owner's create approval, for a re-created name (formats §9.3.1).
+	Binding *bindingMembers `json:"binding,omitempty"`
 }
 
 type frostDkgRound2Req struct {
@@ -61,6 +63,9 @@ type frostDkgCommitReq struct {
 
 type frostSessionReq struct {
 	Session string `json:"session"`
+	// Handle, on an abort: also undo the key this session committed on the
+	// vault while it is still pending (formats §9.3.1).
+	Handle string `json:"handle,omitempty"`
 }
 
 type frostSignRound1Req struct {
@@ -118,6 +123,7 @@ func (c *Client) FrostDkgRound1(ctx context.Context, session, handle, grant stri
 	resp, err := c.call(ctx, vaultRequest{FrostDkgRound1: &frostDkgRound1Req{
 		Session: session, Handle: handle, Grant: grant,
 		Index: uint16(index), Threshold: uint16(threshold), Vaults: vaults,
+		Binding: c.createBinding(handle),
 	}})
 	if err != nil {
 		return nil, err
@@ -312,12 +318,26 @@ func (con *Constellation) CreateThresholdKey(ctx context.Context, handle, grant 
 	}
 	stored := 0
 	fail := func(round string, i int, err error) (*ThresholdKey, error) {
+		// The vaults that committed hold the key pending: the session undoes
+		// it there (no tombstone), so the same handle can be created again.
+		undone := true
 		for _, c := range clients {
-			_ = c.FrostDkgAbort(ctx, session)
+			if stored > 0 {
+				if aerr := c.abortPending(ctx, "dkg", session, handle); aerr != nil {
+					undone = false
+				}
+			} else {
+				_ = c.FrostDkgAbort(ctx, session)
+			}
 		}
 		msg := fmt.Sprintf("%s on vault %s: %v", round, endpoints[i], err)
 		if stored > 0 {
-			msg += fmt.Sprintf("; the key was stored on %d of %d vaults: delete it and create it again", stored, n)
+			if undone {
+				msg += fmt.Sprintf("; the key had been stored on %d of %d vaults and was undone there: retry", stored, n)
+			} else {
+				msg += fmt.Sprintf("; the key was stored on %d of %d vaults and could not be undone on all of them: "+
+					"delete it, and create it under another name", stored, n)
+			}
 		}
 		return nil, errors.New(msg)
 	}
