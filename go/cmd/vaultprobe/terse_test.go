@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -89,6 +90,35 @@ func TestRuleLinesPrintOnlyTheRules(t *testing.T) {
 		t.Fatalf("got %q %v", lines, err)
 	}
 	if _, err := ruleLines([]byte(`{"version":1}`)); err == nil {
+		t.Fatal("a policy without rules was accepted")
+	}
+}
+
+func TestTeesSummaryCountsAndHashesOnly(t *testing.T) {
+	raw := `{"version":1,"principals":{"owner":{"Oidc":{"issuer":"i","sub":"s"}},"tees":[{"Tdx":{"mr_td":"aa11"}},{"Tdx":{"mr_td":"bb22"}}]},"operations":[{"ops":["ExportKey"],"principals":["AnyTee"],"requires":[]}]}`
+	tees, opsSum, err := teesSummary([]byte(raw))
+	if err != nil || len(tees) != 2 {
+		t.Fatalf("got %v %v", tees, err)
+	}
+	for _, s := range append(tees, opsSum) {
+		if len(s) != 64 || strings.Contains(s, "aa11") || strings.Contains(s, "bb22") {
+			t.Fatalf("not a bare SHA-256: %s", s)
+		}
+	}
+	if tees[0] == tees[1] {
+		t.Fatal("different entries hash alike")
+	}
+	first := sha256.Sum256([]byte(`{"Tdx":{"mr_td":"aa11"}}`))
+	if tees[0] != hex.EncodeToString(first[:]) {
+		t.Fatal("an entry's hash is not over its bytes as stored")
+	}
+	// The same operations, a different tees list: the operations hash is unchanged.
+	other := strings.Replace(raw, `,{"Tdx":{"mr_td":"bb22"}}`, ``, 1)
+	tees2, opsSum2, err := teesSummary([]byte(other))
+	if err != nil || len(tees2) != 1 || opsSum2 != opsSum {
+		t.Fatalf("got %v %s %v", tees2, opsSum2, err)
+	}
+	if _, _, err := teesSummary([]byte(`{"principals":{"tees":[]}}`)); err == nil {
 		t.Fatal("a policy without rules was accepted")
 	}
 }

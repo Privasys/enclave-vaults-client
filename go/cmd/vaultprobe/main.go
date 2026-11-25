@@ -48,8 +48,10 @@ import (
 // notStoredForm starts the vault's refusal of a policy not sent in stored form.
 const notStoredForm = "new_policy is not in the vault's stored form"
 
-// showRules: print each key's operation rules (-rules).
-var showRules bool
+// showRules: print each key's operation rules (-rules). showTees: print the
+// number of TEE principals with a SHA-256 per entry, and the SHA-256 of the
+// operations block (-tees).
+var showRules, showTees bool
 
 // The export proof (-export-proof): the key, the identity provider and the
 // audience the approval is issued for.
@@ -68,6 +70,7 @@ func main() {
 		tcb     = flag.String("tcb", "ConfigurationAndSWHardeningNeeded", "comma-separated acceptable TCB statuses")
 		refuse  = flag.String("refuse", "", "run the stored-form refusal check on this handle")
 		rules   = flag.Bool("rules", false, "also print each key's operation rules (ops, principal references, conditions)")
+		tees    = flag.Bool("tees", false, "also print the number of TEE principals, a SHA-256 per entry and the SHA-256 of the operation rules (no measurements)")
 		proof   = flag.String("export-proof", "", "ask ONE rules-change approval for this key and present it to ExportKey on each member; prints only refused or EXPORTED with a SHA-256")
 		issuer  = flag.String("issuer", "https://privasys.id", "identity provider (export proof only)")
 		aud     = flag.String("audience", "privasys-platform", "the vaults' bearer audience (export proof only)")
@@ -75,7 +78,7 @@ func main() {
 	)
 	flag.Var(&hs, "handle", "a key handle to read (repeatable)")
 	flag.Parse()
-	showRules = *rules
+	showRules, showTees = *rules, *tees
 	exportProofHandle, idpIssuer, vaultAudience = *proof, *issuer, *aud
 	if err := run(*mre, *members, *attURL, *tcb, *refuse, hs); err != nil {
 		fmt.Fprintln(os.Stderr, "vaultprobe:", err)
@@ -180,6 +183,17 @@ func readKey(ctx context.Context, c *vault.Client, h string) {
 	} else {
 		sum := sha256.Sum256(raw)
 		fmt.Printf("     policy: version=%d sha256=%s\n", ver, hex.EncodeToString(sum[:]))
+		if showTees {
+			tees, opsSum, err := teesSummary(raw)
+			if err != nil {
+				fmt.Printf("     tees: %v\n", err)
+			} else {
+				fmt.Printf("     tees: %d; operations sha256=%s\n", len(tees), opsSum)
+				for i, s := range tees {
+					fmt.Printf("     tee %d: sha256=%s\n", i, s)
+				}
+			}
+		}
 		if showRules {
 			lines, err := ruleLines(raw)
 			if err != nil {

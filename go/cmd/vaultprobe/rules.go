@@ -4,9 +4,37 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 )
+
+// teesSummary returns, from a key's raw policy (as GetPolicy returns it, in
+// the vault's stored form), the number of entries in principals.tees, the
+// SHA-256 of each entry's bytes as stored, and the SHA-256 of the operations
+// block's bytes as stored. Nothing of an entry itself (no measurement field)
+// is returned: two reads can be compared, an entry cannot be read back.
+func teesSummary(raw []byte) (tees []string, opsSum string, err error) {
+	var p struct {
+		Principals struct {
+			Tees []json.RawMessage `json:"tees"`
+		} `json:"principals"`
+		Operations json.RawMessage `json:"operations"`
+	}
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, "", err
+	}
+	if p.Operations == nil {
+		return nil, "", errors.New("the policy has no operation rules")
+	}
+	for _, t := range p.Principals.Tees {
+		sum := sha256.Sum256(t)
+		tees = append(tees, hex.EncodeToString(sum[:]))
+	}
+	sum := sha256.Sum256(p.Operations)
+	return tees, hex.EncodeToString(sum[:]), nil
+}
 
 // ruleLines returns a key's operation rules from its raw policy (as GetPolicy
 // returns it), one compact JSON line per rule, in order: the rule's ops, its
