@@ -19,7 +19,9 @@
 //	} | vaultprobe -mrenclave <hex> -members host:port,host:port -handle <h> [-handle <h>] [-refuse <h>]
 //
 // Per member and handle it prints GetKeyInfo (or the tombstone of a deleted
-// key), the raw policy's version and SHA-256, and the audit log. With -refuse,
+// key), the raw policy's version and SHA-256, and the audit log. With -rules it
+// also prints the key's operation rules: each rule's ops, principal references
+// and conditions, nothing else of the policy. With -refuse,
 // it sends the named key's own policy with one default left out (the owner's
 // empty required_roles: the same policy, not in the vault's stored form), with
 // NO approval, to each member, and checks that the vault refuses it before
@@ -46,6 +48,9 @@ import (
 // notStoredForm starts the vault's refusal of a policy not sent in stored form.
 const notStoredForm = "new_policy is not in the vault's stored form"
 
+// showRules: print each key's operation rules (-rules).
+var showRules bool
+
 type handles []string
 
 func (h *handles) String() string     { return strings.Join(*h, ",") }
@@ -58,10 +63,12 @@ func main() {
 		attURL  = flag.String("attestation-server", "https://as.privasys.org/verify", "quote verification endpoint")
 		tcb     = flag.String("tcb", "ConfigurationAndSWHardeningNeeded", "comma-separated acceptable TCB statuses")
 		refuse  = flag.String("refuse", "", "run the stored-form refusal check on this handle")
+		rules   = flag.Bool("rules", false, "also print each key's operation rules (ops, principal references, conditions)")
 		hs      handles
 	)
 	flag.Var(&hs, "handle", "a key handle to read (repeatable)")
 	flag.Parse()
+	showRules = *rules
 	if err := run(*mre, *members, *attURL, *tcb, *refuse, hs); err != nil {
 		fmt.Fprintln(os.Stderr, "vaultprobe:", err)
 		os.Exit(1)
@@ -161,6 +168,15 @@ func readKey(ctx context.Context, c *vault.Client, h string) {
 	} else {
 		sum := sha256.Sum256(raw)
 		fmt.Printf("     policy: version=%d sha256=%s\n", ver, hex.EncodeToString(sum[:]))
+		if showRules {
+			lines, err := ruleLines(raw)
+			if err != nil {
+				fmt.Printf("     rules: %v\n", err)
+			}
+			for i, l := range lines {
+				fmt.Printf("     rule %d: %s\n", i, l)
+			}
+		}
 	}
 	entries, _, err := c.ReadAuditLog(ctx, h, 0, 1024)
 	if err != nil {

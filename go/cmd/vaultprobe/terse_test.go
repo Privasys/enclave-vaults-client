@@ -62,6 +62,35 @@ func TestBearersComeFromTwoLines(t *testing.T) {
 	}
 }
 
+func TestRuleLinesPrintOnlyTheRules(t *testing.T) {
+	lines, err := ruleLines([]byte(storedV2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		`{"ops":["DeleteKey","UpdatePolicy"],"principals":["Owner"],"requires":[{"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":true,"fresh_for_seconds":300,"binding":2}}]}`,
+		`{"ops":["ExportKey"],"principals":["Owner"],"requires":[{"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":true,"fresh_for_seconds":300,"binding":2}}]}`,
+	}
+	if !reflect.DeepEqual(lines, want) {
+		t.Fatalf("got %q", lines)
+	}
+	for _, l := range lines {
+		for _, leak := range []string{`"sub"`, `"issuer"`, "mutability", "lifecycle", "ttl_seconds"} {
+			if strings.Contains(l, leak) {
+				t.Fatalf("a rule line carries %s: %s", leak, l)
+			}
+		}
+	}
+	// A rule with no conditions prints an empty list, not null.
+	lines, err = ruleLines([]byte(`{"operations":[{"ops":["ExportKey"],"principals":[{"AnyTee":true}]}]}`))
+	if err != nil || len(lines) != 1 || !strings.HasSuffix(lines[0], `"requires":[]}`) {
+		t.Fatalf("got %q %v", lines, err)
+	}
+	if _, err := ruleLines([]byte(`{"version":1}`)); err == nil {
+		t.Fatal("a policy without rules was accepted")
+	}
+}
+
 func TestSplitList(t *testing.T) {
 	if got := splitList(" a, ,b,"); !reflect.DeepEqual(got, []string{"a", "b"}) {
 		t.Fatal(got)
