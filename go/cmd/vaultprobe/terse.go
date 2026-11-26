@@ -12,10 +12,11 @@ import (
 // terseVariant returns the same policy as raw (a policy as GetPolicy returns
 // it, in stored form) with one default left out: the owner's required_roles
 // when it is the empty list. It means exactly the same policy, so even a vault
-// that wrongly accepted it would change nothing; a vault applying formats §5.1
-// must refuse it. It refuses to produce a variant unless every rule granting
-// UpdatePolicy asks for a binding 2 step-up (so no approval-free update could
-// pass) and the owner's required_roles is present and empty.
+// that wrongly accepted it would change nothing; a vault that takes a policy
+// update only in its stored form must refuse it. It refuses to produce a
+// variant unless every rule granting UpdatePolicy asks for a binding 2
+// step-up (so no approval-free update could pass) and the owner's
+// required_roles is present and empty.
 func terseVariant(raw []byte) ([]byte, error) {
 	var p map[string]any
 	if err := json.Unmarshal(raw, &p); err != nil {

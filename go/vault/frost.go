@@ -39,7 +39,7 @@ type frostDkgRound1Req struct {
 	Index     uint16   `json:"index"`
 	Threshold uint16   `json:"threshold"`
 	Vaults    []string `json:"vaults"`
-	// The owner's create approval, for a re-created name (formats §9.3.1).
+	// The owner's create approval, for a name re-created after a delete.
 	Binding *bindingMembers `json:"binding,omitempty"`
 }
 
@@ -64,7 +64,7 @@ type frostDkgCommitReq struct {
 type frostSessionReq struct {
 	Session string `json:"session"`
 	// Handle, on an abort: also undo the key this session committed on the
-	// vault while it is still pending (formats §9.3.1).
+	// vault while it is still pending.
 	Handle string `json:"handle,omitempty"`
 }
 

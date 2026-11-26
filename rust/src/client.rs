@@ -163,6 +163,9 @@ pub enum KeyType {
     Aes256GcmKey,
     P256SigningKey,
     HmacSha256Key,
+    /// One vault's share of a threshold Ed25519 key (FROST, RFC 9591). Never
+    /// exportable.
+    FrostEd25519,
 }
 
 /// Per-key operation grantable by an [`OperationRule`].
@@ -306,9 +309,29 @@ pub enum Condition {
         #[serde(default, skip_serializing_if = "is_zero_u64")]
         not_after: u64,
     },
+    /// The caller's OIDC bearer must prove a fresh step-up: its `amr` holds
+    /// every method in `required_amr`, its `iat` is within
+    /// `fresh_for_seconds`, and when `operation_bound` its `vault_op` binds
+    /// this operation. `binding` is 0 (absent) for binding v1, which every
+    /// key created before binding v2 has, and 2 for binding v2, which the
+    /// vault then takes alone.
+    OidcStepUp {
+        #[serde(default)]
+        required_amr: Vec<String>,
+        #[serde(default)]
+        operation_bound: bool,
+        #[serde(default)]
+        fresh_for_seconds: u64,
+        #[serde(default, skip_serializing_if = "is_zero_u8")]
+        binding: u8,
+    },
 }
 
 fn is_zero_u64(x: &u64) -> bool {
+    *x == 0
+}
+
+fn is_zero_u8(x: &u8) -> bool {
     *x == 0
 }
 
@@ -350,6 +373,10 @@ pub struct KeyPolicy {
     pub mutability: Mutability,
     #[serde(default)]
     pub lifecycle: Lifecycle,
+    /// `"none"` opts the key out of approval by default; absent on every
+    /// other key, and on every key created before binding v2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
 }
 
 /// JWT minted by `IssueApprovalToken`.
@@ -1223,5 +1250,74 @@ impl Constellation {
             });
         }
         Ok((out, share_bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A policy as a current vault returns it: a binding v2 step-up and an
+    // explicit "approval".
+    #[test]
+    fn current_policy_parses() {
+        let raw = r#"{"version":1,"principals":{"owner":{"Oidc":{"issuer":"https://privasys.id","sub":"s","required_roles":[]}},"managers":[],"auditors":[],"tees":[]},
+            "operations":[{"ops":["PromoteProfile","UpdatePolicy","DeleteKey"],"principals":["Owner"],
+            "requires":[{"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":true,"fresh_for_seconds":300,"binding":2}}]}],
+            "lifecycle":{"ttl_seconds":7776000},"approval":"none"}"#;
+        let p: KeyPolicy = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.approval.as_deref(), Some("none"));
+        match &p.operations[0].requires[0] {
+            Condition::OidcStepUp {
+                required_amr,
+                operation_bound,
+                fresh_for_seconds,
+                binding,
+            } => {
+                assert_eq!(required_amr, &["webauthn".to_string()]);
+                assert!(*operation_bound);
+                assert_eq!((*fresh_for_seconds, *binding), (300, 2));
+            }
+            c => panic!("unexpected condition {c:?}"),
+        }
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back["approval"], "none");
+        assert_eq!(
+            back["operations"][0]["requires"][0]["OidcStepUp"]["binding"],
+            2
+        );
+    }
+
+    // An older answer: no "approval", a v1 step-up with no "binding".
+    #[test]
+    fn older_policy_parses() {
+        let raw = r#"{"version":1,"principals":{"owner":{"Oidc":{"issuer":"https://privasys.id","sub":"s","required_roles":[]}},"managers":[],"auditors":[],"tees":[]},
+            "operations":[{"ops":["ExportKey"],"principals":["Owner"],"requires":[{"OidcStepUp":{"required_amr":["webauthn"]}}]}]}"#;
+        let p: KeyPolicy = serde_json::from_str(raw).unwrap();
+        assert!(p.approval.is_none());
+        match &p.operations[0].requires[0] {
+            Condition::OidcStepUp {
+                operation_bound,
+                fresh_for_seconds,
+                binding,
+                ..
+            } => {
+                assert_eq!(
+                    (*operation_bound, *fresh_for_seconds, *binding),
+                    (false, 0, 0)
+                );
+            }
+            c => panic!("unexpected condition {c:?}"),
+        }
+        let back = serde_json::to_string(&p).unwrap();
+        assert!(!back.contains("approval") && !back.contains("binding"));
+    }
+
+    #[test]
+    fn threshold_key_type_parses() {
+        let e: KeyListEntry =
+            serde_json::from_str(r#"{"handle":"h","key_type":"FrostEd25519","expires_at":1}"#)
+                .unwrap();
+        assert_eq!(e.key_type, KeyType::FrostEd25519);
     }
 }

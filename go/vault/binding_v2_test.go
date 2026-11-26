@@ -120,7 +120,7 @@ func TestCanonicalJSON(t *testing.T) {
 	}
 }
 
-// The vector of the formats' §5.2, computed from the specification's text.
+// The binding v2 vector, computed by hand from the binding text's definition.
 func TestBindingV2SpecVector(t *testing.T) {
 	b := BindingV2{
 		Members:       []string{strings.Repeat("2", 64), strings.Repeat("1", 64)},

@@ -3,8 +3,9 @@
 
 // Command vaultprobe reads keys on EVERY member of a vault constellation, one
 // member at a time, for an independent view of what each vault holds. It is
-// read only, except for an optional refusal check that sends one request the
-// vaults must refuse.
+// read only, except for two optional checks: -refuse sends one policy update
+// the vaults must refuse, and -export-proof presents one rules-change approval
+// to ExportKey, which the vaults must refuse.
 //
 // It holds no sign-in code and stores nothing. The two bearers are read from
 // standard input, one per line, and kept in memory only:
@@ -25,7 +26,8 @@
 // it sends the named key's own policy with one default left out (the owner's
 // empty required_roles: the same policy, not in the vault's stored form), with
 // NO approval, to each member, and checks that the vault refuses it before
-// anything else and that the policy version is unchanged (formats §5.1).
+// anything else and that the policy version is unchanged: a vault takes a
+// policy update only in its stored form.
 package main
 
 import (
@@ -73,7 +75,7 @@ func main() {
 		tees    = flag.Bool("tees", false, "also print the number of TEE principals, a SHA-256 per entry and the SHA-256 of the operation rules (no measurements)")
 		proof   = flag.String("export-proof", "", "ask ONE rules-change approval for this key and present it to ExportKey on each member; prints only refused or EXPORTED with a SHA-256")
 		issuer  = flag.String("issuer", "https://privasys.id", "identity provider (export proof only)")
-		aud     = flag.String("audience", "privasys-platform", "the vaults' bearer audience (export proof only)")
+		aud     = flag.String("audience", "", "the vaults' bearer audience the approval is issued for (required with -export-proof)")
 		hs      handles
 	)
 	flag.Var(&hs, "handle", "a key handle to read (repeatable)")
@@ -94,6 +96,9 @@ func run(mre, members, attURL, tcb, refuse string, hs []string) error {
 	eps := splitList(members)
 	if len(eps) == 0 || (len(hs) == 0 && refuse == "" && exportProofHandle == "") {
 		return errors.New("need -members and at least one -handle, -refuse or -export-proof")
+	}
+	if exportProofHandle != "" && vaultAudience == "" {
+		return errors.New("-export-proof needs -audience: the vaults' bearer audience the approval is issued for")
 	}
 	owner, att, err := readBearers(bufio.NewReader(os.Stdin))
 	if err != nil {
@@ -216,8 +221,9 @@ func readKey(ctx context.Context, c *vault.Client, h string) {
 }
 
 // refusalCheck sends the key's own policy, not in stored form, with no
-// approval, and reports whether the vault refused it as formats §5.1 says and
-// left the policy unchanged.
+// approval, and reports whether the vault refused it as not in its stored form
+// and left the policy unchanged. A key whose rules do not allow the check
+// fails it: nothing is sent, and the run fails.
 func refusalCheck(ctx context.Context, c *vault.Client, h string) bool {
 	fmt.Printf("  -- refusal check on %s\n", h)
 	raw, before, err := c.GetPolicyRaw(ctx, h)
@@ -227,7 +233,7 @@ func refusalCheck(ctx context.Context, c *vault.Client, h string) bool {
 	}
 	terse, err := terseVariant(raw)
 	if err != nil {
-		fmt.Printf("     SKIP (nothing sent): %v\n", err)
+		fmt.Printf("     FAIL (nothing sent): %v\n", err)
 		return false
 	}
 	_, uerr := c.UpdatePolicyRaw(ctx, h, terse)

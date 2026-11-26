@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-// The vault's own update_policy_from vector (formats §5.3).
+// The vault's own update_policy_from vector.
 func TestUpdatePolicyFromVector(t *testing.T) {
 	raw, err := os.ReadFile("testdata/v2_vectors.json")
 	if err != nil {
@@ -64,6 +64,39 @@ func TestUpdatePolicyFromVector(t *testing.T) {
 	}
 	if op, err := b.VaultOp(); err != nil || op != f.VaultOp {
 		t.Fatalf("vault_op %s (%v), want %s", op, err, f.VaultOp)
+	}
+}
+
+// The vault's stored-form vector: the digest of a policy as CanonicalisePolicy
+// returns it is the one the vault binds, so a binding v2 update approves
+// exactly the policy it stores.
+func TestStoredFormForV2UpdatesVector(t *testing.T) {
+	raw, err := os.ReadFile("testdata/v2_vectors.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		Stored struct {
+			StoredForm   string `json:"stored_form_as_canonicalise_policy_returns_it"`
+			StoredPD     string `json:"stored_pd"`
+			PDAsSent     string `json:"pd_of_stored_form_as_sent"`
+			SentNotStore string `json:"sent_not_stored_form"`
+			Refusal      string `json:"refusal"`
+		} `json:"stored_form_for_v2_updates"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatal(err)
+	}
+	s := v.Stored
+	if s.StoredForm == "" || s.StoredPD == "" || s.SentNotStore == "" || s.Refusal == "" {
+		t.Fatal("stored_form_for_v2_updates is missing a field")
+	}
+	pd, err := PolicyDigestJSON([]byte(s.StoredForm))
+	if err != nil || pd != s.StoredPD {
+		t.Fatalf("PD(stored form) = %s (%v), want %s", pd, err, s.StoredPD)
+	}
+	if s.PDAsSent != s.StoredPD {
+		t.Fatalf("pd_of_stored_form_as_sent %s differs from stored_pd %s", s.PDAsSent, s.StoredPD)
 	}
 }
 

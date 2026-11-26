@@ -66,8 +66,8 @@ func DeleteAfterTarget(successorHandle, successorTarget string) (string, error) 
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// ImplicitBillingID is a step 1 vault's billing id, before billing
-// configurations exist: hex SHA-256 of "privasys-billing-implicit-v0\n" iss
+// ImplicitBillingID is the billing id of a vault that has no billing
+// configuration: hex SHA-256 of "privasys-billing-implicit-v0\n" iss
 // "\n" aud, from the vault's one issuer and audience.
 func ImplicitBillingID(issuer, audience string) string {
 	sum := sha256.Sum256([]byte("privasys-billing-implicit-v0\n" + issuer + "\n" + audience))
@@ -87,12 +87,11 @@ const (
 	BindIssuerDelete    BindingOp = "issuer_delete"
 	BindUpdatePolicy    BindingOp = "update_policy"
 	// BindUpdatePolicyFrom is update_policy that also binds the policy it
-	// replaces (formats §5.3). Used only when every member lists
-	// CapabilityUpdatePolicyFrom.
+	// replaces, so an approval shown one policy cannot replace another. Used
+	// only when every member lists CapabilityUpdatePolicyFrom.
 	BindUpdatePolicyFrom BindingOp = "update_policy_from"
 	BindDelete           BindingOp = "delete"
 	BindReshare          BindingOp = "reshare"
-	BindRevokePending    BindingOp = "revoke_pending"
 	// BindDeleteAfter deletes the old key of a migration or upgrade, approved
 	// in the same tap as its successor's promote or creation (DeleteAfterTarget).
 	BindDeleteAfter BindingOp = "delete_after"
@@ -101,7 +100,7 @@ const (
 func (o BindingOp) valid() bool {
 	switch o {
 	case BindCreate, BindPromote, BindExport, BindExportAssembled, BindIssuerCreate,
-		BindIssuerUpdate, BindIssuerDelete, BindUpdatePolicy, BindDelete, BindReshare, BindRevokePending,
+		BindIssuerUpdate, BindIssuerDelete, BindUpdatePolicy, BindDelete, BindReshare,
 		BindDeleteAfter, BindUpdatePolicyFrom:
 		return true
 	}
@@ -590,7 +589,7 @@ func (c *Client) GetVaultIdentity(ctx context.Context) (VaultIdentity, error) {
 // approval: the sorted member set the vault rebuilds the text from.
 type bindingMembers struct {
 	Members []string `json:"members"`
-	// ReplacedPD is PD(current policy) on an update_policy_from (§5.3).
+	// ReplacedPD is PD(current policy) on an update_policy_from.
 	ReplacedPD string `json:"replaced_pd,omitempty"`
 }
 
@@ -604,7 +603,8 @@ func (c *Client) bindingMembers() *bindingMembers {
 }
 
 // CapabilityUpdatePolicyFrom is advertised by a vault that accepts
-// update_policy_from (formats §5.3).
+// update_policy_from: a policy update approval that also binds the policy it
+// replaces.
 const CapabilityUpdatePolicyFrom = "update-policy-from-v1"
 
 // UpdatePolicyFromTarget is the target of an update_policy_from: hex

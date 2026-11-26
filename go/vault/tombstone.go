@@ -1,3 +1,6 @@
+// Copyright (c) Privasys. All rights reserved.
+// Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
 package vault
 
 import (
@@ -8,11 +11,11 @@ import (
 )
 
 // CapabilityTombstones is advertised by a vault that keeps tombstones
-// (formats §9.3): a deleted key answers "key deleted" to its principals and
+// of deleted keys: a deleted key answers "key deleted" to its principals and
 // its handle cannot be created again until the key's original expiry; a
 // re-created name (".../new-<k>") needs its owner's bound create approval
 // and GetKeyInfo reports CreatedByOwnerApproval; a threshold key committed by
-// a session that then failed is aborted through that session (§9.3.1).
+// a session that then failed is aborted through that session.
 const CapabilityTombstones = "tombstones-v1"
 
 // KeyTombstone is what GetKeyInfo returns, to the principals of a deleted
@@ -73,7 +76,7 @@ func isNewSegment(seg string) bool {
 }
 
 // IsReCreatedName reports whether handle's last segment is "new-<digits>":
-// a name re-created after a delete (formats §9.3.1). The vault creates it
+// a name re-created after a delete. The vault creates it
 // only with the owner's bound create approval.
 func IsReCreatedName(handle string) bool {
 	segs := strings.Split(handle, "/")
@@ -113,7 +116,7 @@ func (c *Client) createBinding(handle string) *bindingMembers {
 }
 
 // abortPending undoes a threshold key a session committed on this vault and
-// that has served nothing yet (formats §9.3.1): within the session's time,
+// that has served nothing yet: within the session's time,
 // by the same caller. No tombstone is left.
 func (c *Client) abortPending(ctx context.Context, kind, session, handle string) error {
 	req := &frostSessionReq{Session: session, Handle: handle}

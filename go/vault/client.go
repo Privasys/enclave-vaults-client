@@ -268,7 +268,7 @@ type AttestationProfile struct {
 // For TDX all three are pinned and must match: MRTD is the TD firmware
 // (per-platform), RTMR1/RTMR2 are the image-derived registers (EFI/UKI boot path
 // + dm-verity root) that identify the enclave-os-virtual build. MRTD alone does
-// not capture the guest image. See .operations/platform/enclave-upgrade.md.
+// not capture the guest image.
 type Measurement struct {
 	Mrenclave string          `json:"Mrenclave,omitempty"`
 	Tdx       *TdxMeasurement `json:"Tdx,omitempty"`
@@ -390,17 +390,19 @@ type Condition struct {
 }
 
 // OidcStepUpCond requires the caller's OIDC bearer to prove a fresh WebAuthn
-// step-up bound to this operation (the vault promote step-up; the MR_APP / promote-step-up design
-// §9). The token's amr must contain every method in RequiredAmr, its iat must be
+// step-up bound to this operation. The token's amr must contain every method in RequiredAmr, its iat must be
 // within FreshForSeconds, and when OperationBound the token's vault_op must bind
 // (handle, promoted measurement, policy_version, nonce, exp).
 type OidcStepUpCond struct {
 	RequiredAmr     []string `json:"required_amr,omitempty"`
 	OperationBound  bool     `json:"operation_bound,omitempty"`
 	FreshForSeconds uint64   `json:"fresh_for_seconds,omitempty"`
-	// Binding is 2 for binding v2 (wallet-signed-authority-wire-formats.md
-	// §5): the vault then takes only a v2 vault_op for this rule. Absent (0)
-	// on every key created before v2, which takes v1 only.
+	// Binding is 2 for binding v2: the vault then takes only a v2 vault_op
+	// for this rule, one that names the vault's members, the operation, the
+	// key, its target and policy version, the approver and the approval's
+	// nonce and expiry. Absent (0) on every key created before v2, which
+	// takes v1 only. See docs/vault.md in
+	// https://github.com/Privasys/enclave-os-mini.
 	Binding uint8 `json:"binding,omitempty"`
 }
 
@@ -448,8 +450,9 @@ type KeyPolicy struct {
 	Operations []OperationRule `json:"operations"`
 	Mutability Mutability      `json:"mutability,omitempty"`
 	Lifecycle  Lifecycle       `json:"lifecycle,omitempty"`
-	// Approval "none" opts a key out of approval by default (formats §4);
-	// empty on every other key.
+	// Approval "none" opts a key out of approval by default (a vault
+	// otherwise asks for the owner's bound approval on the operations that
+	// change or release the key); empty on every other key.
 	Approval string `json:"approval,omitempty"`
 }
 
@@ -483,11 +486,11 @@ type KeyInfo struct {
 	// Threshold is set for a FrostEd25519 key: this vault's part (public).
 	Threshold *ThresholdKeyInfo `json:"threshold,omitempty"`
 	// RenewedInPlaceFrom is the key this one renewed in place on this vault
-	// (formats §9.1); empty for a first creation or a carried move. Trust it
+	// as its previous generation; empty for a first creation or a carried move. Trust it
 	// only from a vault whose identity lists CapabilityGenerations.
 	RenewedInPlaceFrom string `json:"renewed_in_place_from,omitempty"`
 	// CreatedByOwnerApproval: the vault created this key with its owner's
-	// bound create approval (formats §9.3.1). A client accepts a re-created
+	// bound create approval. A client accepts a re-created
 	// name ("<name>/new-<k>") only when this is true on the pinned vaults,
 	// from vaults listing CapabilityTombstones.
 	CreatedByOwnerApproval bool `json:"created_by_owner_approval,omitempty"`
@@ -583,7 +586,7 @@ type createKeyReq struct {
 	// IdP-issued key-creation grant (JWT) carrying owner, scope, key type,
 	// exportable flag and policy.
 	Grant string `json:"grant"`
-	// The owner's create approval, for a re-created name (formats §9.3.1):
+	// The owner's create approval, for a name re-created after a delete:
 	// the bearer is the owner's step-up; this names the members.
 	Binding *bindingMembers `json:"binding,omitempty"`
 }
@@ -661,10 +664,11 @@ type promotePendingProfileReq struct {
 	Binding   *bindingMembers `json:"binding,omitempty"`
 }
 
+// revokePendingProfileReq carries no binding: the vault's own rules gate a
+// revoke, not an approval.
 type revokePendingProfileReq struct {
-	Handle    string          `json:"handle"`
-	PendingID uint32          `json:"pending_id"`
-	Binding   *bindingMembers `json:"binding,omitempty"`
+	Handle    string `json:"handle"`
+	PendingID uint32 `json:"pending_id"`
 }
 
 // vaultResponse is the externally-tagged response envelope.
@@ -850,8 +854,9 @@ type DialOptions struct {
 	Attestation ratls.AttestationMode
 
 	// BindingMembers is the member set of a binding v2 approval. When set, every
-	// approval-gated request (export, delete, policy update, promote, revoke of
-	// a pending profile) carries it as "binding":{"members":[...]}, sorted, and
+	// approval-gated request (export, delete, policy update, promote, and the
+	// creation of a name re-created after a delete) carries it as
+	// "binding":{"members":[...]}, sorted, and
 	// each vault rebuilds the approval's text from it and its own state.
 	BindingMembers []string
 }
@@ -998,8 +1003,9 @@ func (c *Client) UpdatePolicy(ctx context.Context, handle string, newPolicy KeyP
 }
 
 // DeleteKeyAfter deletes the old key of a migration, a rotation or an
-// upgrade under a delete_after approval (binding v2, formats §9.2): the
-// request names the successor, and successorTarget is the successor's promote
+// upgrade under a delete_after approval (binding v2). The vault refuses it
+// until the successor has succeeded, where it can see it. The request names
+// the successor, and successorTarget is the successor's promote
 // target, or "-" when it was created rather than promoted. The vault
 // recomputes the bound target from them and refuses a successor equal to the
 // key.
@@ -1041,7 +1047,7 @@ func (c *Client) deleteKeyAfterPayload(handle, successor, successorTarget string
 
 // UpdatePolicyRaw replaces the policy on an existing key with newPolicy as
 // given, never re-serialised: a binding v2 update_policy approval binds the
-// digest of the policy JSON the owner was shown (PD, binding v2 §5.1), so the
+// digest of the policy JSON the owner was shown (PD, binding v2), so the
 // request must carry that JSON, with exactly its fields. The bytes are
 // compacted on the wire, which the digest (over the JCS form) does not see.
 func (c *Client) UpdatePolicyRaw(ctx context.Context, handle string, newPolicy json.RawMessage,
@@ -1094,7 +1100,8 @@ func (c *Client) updatePolicyRawPayload(handle string, newPolicy json.RawMessage
 }
 
 // updatePolicyRawFromPayload is the UpdatePolicy request; a non-empty
-// replacedPD makes it an update_policy_from (formats §5.3).
+// replacedPD makes it an update_policy_from, which also binds the policy it
+// replaces.
 func (c *Client) updatePolicyRawFromPayload(handle string, newPolicy json.RawMessage, replacedPD string, approvals []ApprovalToken) ([]byte, error) {
 	b := c.bindingMembers()
 	if replacedPD != "" {
@@ -1350,7 +1357,7 @@ func (c *Client) PromotePendingProfile(ctx context.Context, handle string,
 func (c *Client) RevokePendingProfile(ctx context.Context, handle string,
 	pendingID uint32) error {
 	resp, err := c.call(ctx, vaultRequest{RevokePendingProfile: &revokePendingProfileReq{
-		Handle: handle, PendingID: pendingID, Binding: c.bindingMembers(),
+		Handle: handle, PendingID: pendingID,
 	}})
 	if err != nil {
 		return err
@@ -1509,7 +1516,7 @@ func (con *Constellation) RevokePendingProfile(ctx context.Context, handle strin
 
 // DeleteKey fans DeleteKey out to every live vault, carrying any approval
 // tokens to each. Used to retire a superseded key generation (e.g. the old
-// storage-kek/v(N) after a KEK rotation has re-keyed the volume to v(N+1)).
+// gen-<n> after a KEK rotation has re-keyed the volume to gen-<n+1>).
 // Partial failures are surfaced verbatim; re-driving is idempotent (a vault
 // that no longer holds the handle simply reports it gone).
 func (con *Constellation) DeleteKey(ctx context.Context, handle string,

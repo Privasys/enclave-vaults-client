@@ -28,7 +28,8 @@ import (
 // proves that a rules-change approval cannot export the key. The approval is
 // kept in memory, never printed, and left to expire; no rules change is made.
 // If a vault does export, only the SHA-256 of what it returned is printed, and
-// the material is overwritten.
+// the material is overwritten. It passes only when every member refused the
+// approval because it does not bind the export.
 func exportProof(ctx context.Context, eps []string, policy *ratls.VerificationPolicy, owner, issuer, audience, handle string) error {
 	if len(eps) == 0 {
 		return errors.New("no members")
@@ -50,39 +51,93 @@ func exportProof(ctx context.Context, eps []string, policy *ratls.VerificationPo
 	if err != nil {
 		return err
 	}
-	exported := false
+	// Every member must give a verdict: a member not reached, or one that
+	// refused for any reason but the approval's binding, fails the check.
+	var exported, notChecked, inconclusive []string
 	for _, ep := range eps {
 		c, err := vault.Dial(ctx, vault.VaultRegistration{ID: ep, Endpoint: ep, Status: "probe"},
 			vault.DialOptions{AuthToken: vault.StaticToken(token), VaultPolicy: policy})
 		if err != nil {
-			fmt.Printf("== %s: dial: %v\n", ep, err)
+			fmt.Printf("== %s: FAIL: not checked (dial: %v)\n", ep, err)
+			notChecked = append(notChecked, ep)
 			continue
 		}
 		material, xerr := c.ExportKey(ctx, handle)
 		c.Close()
-		fmt.Printf("== %s: %s\n", ep, exportVerdict(material, xerr))
-		if xerr == nil {
-			exported = true
+		kind, line := exportVerdict(material, xerr)
+		fmt.Printf("== %s: %s\n", ep, line)
+		switch kind {
+		case verdictExported:
+			exported = append(exported, ep)
+		case verdictInconclusive:
+			inconclusive = append(inconclusive, ep)
 		}
 		for i := range material {
 			material[i] = 0
 		}
 	}
 	token = ""
-	if exported {
-		return errors.New("a vault EXPORTED the key with a rules-change approval")
+	var problems []string
+	if len(exported) > 0 {
+		problems = append(problems, "EXPORTED the key with a rules-change approval: "+strings.Join(exported, ", "))
+	}
+	if len(inconclusive) > 0 {
+		problems = append(problems, "inconclusive (refused for a reason other than the approval's binding): "+strings.Join(inconclusive, ", "))
+	}
+	if len(notChecked) > 0 {
+		problems = append(problems, "not checked (dial failed): "+strings.Join(notChecked, ", "))
+	}
+	if len(problems) > 0 {
+		return errors.New("export check failed: " + strings.Join(problems, "; "))
 	}
 	return nil
 }
 
-// exportVerdict is the one line printed per member: the refusal, or that the
-// vault exported, with only the SHA-256 of what it returned.
-func exportVerdict(material []byte, err error) string {
+// bindingRefusals are the vault's refusals of an approval that does not bind
+// the operation it is presented to: the only refusals that show a rules-change
+// approval cannot export the key. Any other refusal (audience, sign-in, an
+// unknown or non-exportable key, the network) proves nothing about the
+// approval.
+var bindingRefusals = []string{
+	"vault_op does not bind this operation",
+	"OidcStepUp: operation_bound required but this operation carries no binding context",
+	"OidcStepUp: binding v2 required",
+	"the approval does not name this vault",
+}
+
+type verdict int
+
+const (
+	verdictRefused verdict = iota
+	verdictInconclusive
+	verdictExported
+)
+
+// exportVerdict classifies one member's answer and gives the line printed for
+// it: the expected binding refusal, a refusal for another reason
+// (inconclusive), or that the vault exported, with only the SHA-256 of what it
+// returned.
+func exportVerdict(material []byte, err error) (verdict, string) {
 	if err != nil {
-		return "refused: " + err.Error()
+		if isBindingRefusal(err) {
+			return verdictRefused, "PASS: refused: " + err.Error()
+		}
+		return verdictInconclusive, "FAIL: inconclusive: " + err.Error()
 	}
 	sum := sha256.Sum256(material)
-	return "EXPORTED (sha256 of material: " + hex.EncodeToString(sum[:]) + ")"
+	return verdictExported, "FAIL: EXPORTED (sha256 of material: " + hex.EncodeToString(sum[:]) + ")"
+}
+
+// isBindingRefusal reports whether err is the vault refusing the approval
+// because it does not bind the export.
+func isBindingRefusal(err error) bool {
+	msg := err.Error()
+	for _, r := range bindingRefusals {
+		if strings.Contains(msg, r) {
+			return true
+		}
+	}
+	return false
 }
 
 // policyUpdateApproval opens a v1 "policy-update" approval at privasys.id (the
@@ -98,7 +153,7 @@ func policyUpdateApproval(ctx context.Context, issuer, bearer, audience, handle 
 		"ttl_seconds":        300,
 		"audience":           audience,
 		"context": map[string]string{
-			"summary": "Live proof (Security): this approval is presented as an export and must be refused. No rules change is made.",
+			"summary": "vaultprobe export check: this approval must be refused; no rules change is made.",
 		},
 	})
 	opts, err := idpCall(ctx, http.MethodPost, issuer+"/fido2/vault-approval/begin", bearer, begin)

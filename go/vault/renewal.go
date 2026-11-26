@@ -3,10 +3,10 @@
 
 package vault
 
-// Renewal of a key by the app that holds it (wallet-signed-authority-wire-
-// formats.md §9, §9.1, §10.4): in place on the same vault, or onto another
-// constellation with the policy read fresh from the source vault and carried
-// verbatim; and the retirement of the previous generation afterwards.
+// Renewal of a key by the app that holds it: in place on the same vault, or
+// onto another constellation with the policy read fresh from the source
+// vault and carried verbatim; and the retirement of the previous generation
+// afterwards. See docs/vault.md in https://github.com/Privasys/enclave-os-mini.
 
 import (
 	"bytes"
@@ -22,19 +22,20 @@ import (
 )
 
 // ErrUnsupported reports a vault that does not know the request: a vault
-// built before step 1 answers an unknown request by echoing it back.
+// build that predates a request answers it by echoing it back.
 var ErrUnsupported = errors.New("vault: request not supported by this vault build")
 
 // IsUnsupported reports whether err means the vault does not know the request.
 func IsUnsupported(err error) bool { return errors.Is(err, ErrUnsupported) }
 
-// KeyCheck is the key check value of a whole key (formats §10.4).
+// KeyCheck is the key check value of a whole key: an Argon2id digest under a
+// random salt, which the vault stores opaquely and never returns.
 type KeyCheck struct {
 	SaltB64   string `json:"salt_b64"`
 	DigestHex string `json:"digest_hex"`
 }
 
-// Argon2id parameters of the key check value (formats §10.4).
+// Argon2id parameters of the key check value.
 const (
 	keyCheckTime    = 3
 	keyCheckMemory  = 64 * 1024 // KiB: 64 MiB
@@ -62,7 +63,7 @@ func keyCheckWithSalt(key, salt []byte) KeyCheck {
 	}
 }
 
-// Renewal says where a new generation's policy comes from (formats §9).
+// Renewal says where a new generation's policy comes from.
 //
 //   - In place: Predecessor is the old handle on this same vault; Policy is
 //     nil. The vault copies the predecessor's policy, version and key check.
@@ -74,7 +75,7 @@ type Renewal struct {
 	Predecessor     string
 	Policy          json.RawMessage
 	PolicyVersion   uint32
-	HolderRecords   []json.RawMessage // step 3; nil until then
+	HolderRecords   []json.RawMessage // holder records the carried policy names; vaults refuse any for now, so leave nil
 	SourceBillingID string
 	KeyCheck        *KeyCheck // fresh for a move, rotation or creation; nil in place
 	// With a carried Policy: the source key's exportable flag and type, as
@@ -87,7 +88,7 @@ type Renewal struct {
 // CapabilityGenerations is listed in VaultIdentity.Capabilities by a vault
 // build that reports KeyInfo.RenewedInPlaceFrom, refuses a first creation of a
 // generation handle (last segment "gen-<n>"), and keeps a carried key's
-// exportable flag and type (formats §9.1). Trust a generation link only from
+// exportable flag and type. Trust a generation link only from
 // such a build, over a connection pinned to it.
 const CapabilityGenerations = "generations-v1"
 
@@ -183,7 +184,7 @@ type retireKeyReq struct {
 }
 
 // RetireKey deletes the previous generation of a key after an automatic
-// renewal (formats §9.1). The caller must be an enclave the key's policy
+// renewal. The caller must be an enclave the key's policy
 // names. successorMembers are the sorted member ids of the vaults holding the
 // successor. wasPresent is false when the key was already gone.
 func (c *Client) RetireKey(ctx context.Context, handle, successor string,
@@ -271,7 +272,7 @@ func (c *Client) callRaw(ctx context.Context, payload []byte) (*vaultResponse, e
 }
 
 // CanonicalisePolicy asks the vault for its verdict on a policy without
-// storing anything (formats §5.1): the digest it would bind, or its refusal (a
+// storing anything: the digest it would bind, or its refusal (a
 // field it does not know, a value its normalisation would change). A binding
 // v2 client calls it before asking the owner to approve a policy, so a policy
 // the vault would refuse fails before the tap, not after. Unauthenticated.

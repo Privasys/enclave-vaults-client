@@ -42,8 +42,8 @@ type frostReshareTarget1Req struct {
 	Vaults                 []string `json:"vaults"`
 	Helpers                []uint16 `json:"helpers"`
 	OldPublicKeyPackageB64 string   `json:"old_public_key_package_b64"`
-	// The owner's create approval, for a re-created name new on this vault
-	// (formats §9.3.1).
+	// The owner's create approval, for a name re-created after a delete and
+	// new on this vault.
 	Binding *bindingMembers `json:"binding,omitempty"`
 }
 
@@ -162,6 +162,11 @@ type ReshareApproval struct {
 // vault holds a fresh share; a move destroys the old vaults' shares, a
 // renewal in place drops the previous records. On a failure part-way it
 // rolls back (in place) or removes the new copies (a move).
+//
+// When the resharing succeeded but the clean-up did not finish everywhere, it
+// returns the key AND a *ReshareCleanupError naming the vaults that still
+// hold the previous shares; check for it with errors.As before treating a
+// non-nil error as a failure.
 func ReshareThresholdKey(ctx context.Context, p ReshareParams) (*ThresholdKey, error) {
 	// The old key, from its vaults.
 	homeTok := &swapToken{tok: p.HomeToken}
@@ -359,14 +364,26 @@ func ReshareThresholdKey(ctx context.Context, p ReshareParams) (*ThresholdKey, e
 		if err != nil {
 			abort()
 			undo := "rolled back"
-			for _, cc := range committed {
+			var notUndone []string
+			for j, cc := range committed {
 				if p.InPlace {
-					_, _ = cc.call(ctx, vaultRequest{FrostReshareRollback: &handleReq{Handle: p.Handle}})
+					// The vault puts the previous record back.
+					if _, rerr := cc.call(ctx, vaultRequest{FrostReshareRollback: &handleReq{Handle: p.Handle}}); rerr != nil {
+						notUndone = append(notUndone, fmt.Sprintf("%s: %v", p.Target[j], rerr))
+					}
 				} else if aerr := cc.abortPending(ctx, "reshare", session, p.Handle); aerr != nil {
 					// The session undoes a pending copy with no tombstone, so
-					// a retry can use the same handle (formats §9.3.1).
-					undo = "partly undone: delete the new copies"
+					// a retry can use the same handle.
+					notUndone = append(notUndone, fmt.Sprintf("%s: %v", p.Target[j], aerr))
 				}
+			}
+			if len(notUndone) > 0 {
+				if p.InPlace {
+					undo = "partly undone: these vaults did not roll back to the previous shares: "
+				} else {
+					undo = "partly undone: delete the new copies on: "
+				}
+				undo += strings.Join(notUndone, "; ")
 			}
 			return nil, fmt.Errorf("commit on new vault %s: %w; the %d vault(s) that committed were %s",
 				p.Target[i], err, len(committed), undo)
@@ -377,22 +394,85 @@ func ReshareThresholdKey(ctx context.Context, p ReshareParams) (*ThresholdKey, e
 		}
 	}
 
-	// Done: drop what the key leaves behind.
+	// Done: drop what the key leaves behind. The key is reshared whatever
+	// happens here; a vault that keeps its old share is reported, not hidden.
+	key := &ThresholdKey{Handle: p.Handle, PublicKey: groupKey, Threshold: p.Threshold,
+		Vaults: p.Target, ExpiresAt: expiresAt}
+	var cleanup *ReshareCleanupError
 	if p.InPlace {
-		for _, c := range targets {
-			_, _ = c.call(ctx, vaultRequest{FrostReshareFinalize: &handleReq{Handle: p.Handle}})
-		}
+		cleanup = collectCleanup(p.Target, p.InPlace, func(i int, _ string) error {
+			return targets[i].FinalizeReshare(ctx, p.Handle)
+		})
 	} else {
-		for _, ep := range p.Home {
+		cleanup = collectCleanup(p.Home, p.InPlace, func(_ int, ep string) error {
 			c, err := Dial(ctx, VaultRegistration{ID: ep, Endpoint: ep, Status: "static"}, homeOpts)
-			if err == nil {
-				_ = c.DeleteKey(ctx, p.Handle)
-				c.Close()
+			if err != nil {
+				return fmt.Errorf("dial: %w", err)
 			}
+			defer c.Close()
+			return c.DeleteKey(ctx, p.Handle)
+		})
+	}
+	if cleanup != nil {
+		return key, cleanup
+	}
+	return key, nil
+}
+
+// ReshareCleanupError is returned by ReshareThresholdKey together with the
+// reshared key when the resharing itself succeeded but some vaults still hold
+// the key's previous shares. The key is usable on its new vaults; the old
+// shares are a clean-up debt, not a failure of the resharing.
+//
+// In place, the named vaults did not drop the previous record: retry with
+// Client.FinalizeReshare on each. On a move, the named old vaults did not
+// delete the key: retry with Client.DeleteKey. When the old key's DeleteKey
+// rule asks for a binding 2 step-up, its owner's delete approval is needed
+// (dial with DialOptions.BindingMembers set to the old members); the client
+// never makes one up. Old shares nobody deletes expire with the old key.
+type ReshareCleanupError struct {
+	// InPlace tells which clean-up is owed: FinalizeReshare (true) or
+	// DeleteKey on the old vaults (false).
+	InPlace bool
+	// Vaults are the endpoints still holding the previous shares.
+	Vaults []string
+	// Err joins one error per vault, in the order of Vaults.
+	Err error
+}
+
+func (e *ReshareCleanupError) Error() string {
+	what := "the old vaults still hold their shares"
+	if e.InPlace {
+		what = "the vaults still keep the previous record"
+	}
+	return fmt.Sprintf("reshared, but %s on %s: %v", what, strings.Join(e.Vaults, ", "), e.Err)
+}
+
+func (e *ReshareCleanupError) Unwrap() error { return e.Err }
+
+// collectCleanup runs step on every endpoint and gathers the failures into a
+// ReshareCleanupError, or nil when every endpoint was cleaned up.
+func collectCleanup(eps []string, inPlace bool, step func(i int, ep string) error) *ReshareCleanupError {
+	var vaults []string
+	var errs []error
+	for i, ep := range eps {
+		if err := step(i, ep); err != nil {
+			vaults = append(vaults, ep)
+			errs = append(errs, fmt.Errorf("%s: %w", ep, err))
 		}
 	}
-	return &ThresholdKey{Handle: p.Handle, PublicKey: groupKey, Threshold: p.Threshold,
-		Vaults: p.Target, ExpiresAt: expiresAt}, nil
+	if len(vaults) == 0 {
+		return nil
+	}
+	return &ReshareCleanupError{InPlace: inPlace, Vaults: vaults, Err: errors.Join(errs...)}
+}
+
+// FinalizeReshare drops the previous record a renewal in place of a
+// threshold key kept on this vault, once every vault has committed the new
+// shares. Only the key's owner may call it.
+func (c *Client) FinalizeReshare(ctx context.Context, handle string) error {
+	_, err := c.call(ctx, vaultRequest{FrostReshareFinalize: &handleReq{Handle: handle}})
+	return err
 }
 
 // groupKeyFromInfo reads the key's 32-byte public key from a vault.

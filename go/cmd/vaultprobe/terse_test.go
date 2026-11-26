@@ -125,13 +125,37 @@ func TestTeesSummaryCountsAndHashesOnly(t *testing.T) {
 
 func TestExportVerdictNeverPrintsMaterial(t *testing.T) {
 	secret := []byte("0123456789abcdef-SECRET-MATERIAL")
-	v := exportVerdict(secret, nil)
-	if !strings.HasPrefix(v, "EXPORTED (sha256 of material: ") || strings.Contains(v, "SECRET") ||
+	k, v := exportVerdict(secret, nil)
+	if k != verdictExported || !strings.HasPrefix(v, "FAIL: EXPORTED (sha256 of material: ") || strings.Contains(v, "SECRET") ||
 		strings.Contains(v, hex.EncodeToString(secret)) {
 		t.Fatalf("verdict leaks or is malformed: %s", v)
 	}
-	if v := exportVerdict(nil, errors.New("vault error: no OperationRule grants ExportKey")); v != "refused: vault error: no OperationRule grants ExportKey" {
-		t.Fatalf("got %s", v)
+}
+
+// Only a refusal of the approval's binding passes; any other refusal is
+// inconclusive and fails the run.
+func TestExportVerdictAcceptsOnlyBindingRefusals(t *testing.T) {
+	for _, msg := range []string{
+		"no OperationRule grants ExportKey to caller with all conditions met: OidcStepUp: vault_op does not bind this operation (binding v2)",
+		"no OperationRule grants ExportKey to caller with all conditions met: OidcStepUp: vault_op does not bind this operation (handle/measurement/policy_version/nonce/exp mismatch)",
+		"no OperationRule grants ExportKey to caller with all conditions met: OidcStepUp: binding v2 required: the request must name its members",
+		"no OperationRule grants ExportKey to caller with all conditions met: OidcStepUp: operation_bound required but this operation carries no binding context",
+	} {
+		if k, v := exportVerdict(nil, errors.New(msg)); k != verdictRefused || !strings.HasPrefix(v, "PASS: refused: ") {
+			t.Errorf("%q: got %d %s", msg, k, v)
+		}
+	}
+	for _, msg := range []string{
+		"caller is in policy.principals but no OperationRule grants ExportKey",
+		"key is not exportable",
+		"key not found",
+		"OIDC token audience mismatch",
+		"dial tcp: connection refused",
+		"no OperationRule grants ExportKey to caller with all conditions met: OidcStepUp: token amr [\"pwd\"] does not satisfy required [\"webauthn\"]",
+	} {
+		if k, v := exportVerdict(nil, errors.New(msg)); k != verdictInconclusive || !strings.HasPrefix(v, "FAIL: inconclusive: ") {
+			t.Errorf("%q: got %d %s", msg, k, v)
+		}
 	}
 }
 

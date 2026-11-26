@@ -68,4 +68,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" ../dist/* \
             --title "$GITHUB_REF_NAME" \
-            --notes "vaultprobe: per-member read-only vault reads and the stored-form refusal check (formats §5.1, §9.3). No sign-in code: bearers are read from stdin. Built by CI from ${GITHUB_SHA}."
+            --notes "vaultprobe: per-member read-only vault reads (with the tombstones of deleted keys), the stored-form refusal check and the export check. No sign-in code: bearers are read from stdin. Built by CI from ${GITHUB_SHA}."
