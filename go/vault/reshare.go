@@ -55,6 +55,9 @@ type frostReshareDealReq struct {
 	Vaults          []string                      `json:"vaults"`
 	TargetMrenclave string                        `json:"target_mrenclave"`
 	Targets         map[uint16]frostTargetMessage `json:"targets"`
+	// The members of the owner's binding v2 reshare approval, on vaults that
+	// read every step-up as binding v2 (HomeDial.BindingMembers set).
+	Binding *bindingMembers `json:"binding,omitempty"`
 }
 
 type frostReshareTarget2Req struct {
@@ -140,8 +143,9 @@ type ReshareParams struct {
 	// InPlace: Target is the key's own constellation (same vaults).
 	InPlace bool
 	// StepUp returns the owner's bearer with a fresh wallet approval of
-	// operation "reshare" for Handle, whose measurement slot is
-	// a.ContextHex, at a.PolicyVersion.
+	// operation "reshare" for Handle, of a.ContextHex at a.PolicyVersion: a
+	// binding v2 approval naming HomeDial.BindingMembers when those are set
+	// (vaults with CapabilityBindingV2Always), a v1 one otherwise.
 	StepUp func(ctx context.Context, a ReshareApproval) (string, error)
 }
 
@@ -300,6 +304,7 @@ func ReshareThresholdKey(ctx context.Context, p ReshareParams) (*ThresholdKey, e
 		resp, err := h.c.call(ctx, vaultRequest{FrostReshareDeal: &frostReshareDealReq{
 			Session: session, Handle: p.Handle, Helpers: helperIdx, Threshold: uint16(p.Threshold),
 			Vaults: p.Target, TargetMrenclave: p.TargetMrenclave, Targets: tmsg,
+			Binding: h.c.bindingMembers(),
 		}})
 		if err == nil && resp.FrostReshareDealt == nil {
 			err = ErrUnexpectedResponse

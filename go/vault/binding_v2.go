@@ -607,6 +607,11 @@ func (c *Client) bindingMembers() *bindingMembers {
 // replaces.
 const CapabilityUpdatePolicyFrom = "update-policy-from-v1"
 
+// CapabilityBindingV2Always is listed by a vault build that has no binding v1
+// and reads every step-up as binding v2: every approval for a key it holds is
+// a v2 approval, whatever the key's rules say.
+const CapabilityBindingV2Always = "binding-v2-always-v1"
+
 // UpdatePolicyFromTarget is the target of an update_policy_from: hex
 // H("privasys-update-policy-from-v1\n" PD(current) "\n" PD(new)). PD(current)
 // is the digest of the policy as GetPolicyRaw returns it, the same on every
