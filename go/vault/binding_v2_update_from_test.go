@@ -116,7 +116,7 @@ func TestUpdatePolicyRawFromSendsReplacedPD(t *testing.T) {
 	policy := json.RawMessage(`{"operations":[]}`)
 	pd := strings.Repeat("c", 64)
 	c := &Client{opts: DialOptions{BindingMembers: []string{memberA}}}
-	raw, err := c.updatePolicyRawFromPayload("h", policy, pd, nil)
+	raw, err := c.updatePolicyRawFromPayload("h", policy, pd)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestUpdatePolicyRawFromSendsReplacedPD(t *testing.T) {
 		t.Fatalf("got  %s\nwant %s", raw, want)
 	}
 	// Without a member set there is no binding v2 to carry it.
-	if _, err := (&Client{}).updatePolicyRawFromPayload("h", policy, pd, nil); err == nil {
+	if _, err := (&Client{}).updatePolicyRawFromPayload("h", policy, pd); err == nil {
 		t.Fatal("update_policy_from without members was built")
 	}
 }

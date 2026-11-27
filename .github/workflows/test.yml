@@ -1,0 +1,60 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0.
+#
+# Tests both clients on every push and pull request, so the Go and Rust
+# clients follow every change to the vault's wire formats.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  GOPROXY: "https://proxy.golang.org,direct"
+  GOSUMDB: "sum.golang.org"
+  GOFLAGS: "-mod=readonly"
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout enclave-vaults-client
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          path: enclave-vaults-client
+
+      - name: Checkout ra-tls-clients (sibling for the go.mod replace)
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: Privasys/ra-tls-clients
+          # v0.12.0, as in vaultprobe.yml, pinned by commit.
+          ref: d02eda735d1d372565b5f9549ad166e642e7bbf9
+          path: ra-tls-clients
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: enclave-vaults-client/go/go.mod
+
+      - name: Vet and test
+        working-directory: enclave-vaults-client/go
+        run: |
+          go vet ./...
+          go test ./...
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout enclave-vaults-client
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Format and test
+        working-directory: rust
+        run: |
+          cargo fmt --check
+          cargo test

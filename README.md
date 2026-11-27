@@ -11,7 +11,7 @@ The **vault directory** is a phonebook only: it returns `(endpoint, measurement)
 | Language | Path                                          | Crate / module                                                   |
 | -------- | --------------------------------------------- | ---------------------------------------------------------------- |
 | Go       | [`go/vault/`](go/vault/)                      | `github.com/Privasys/enclave-vaults-client/go/vault`             |
-| Rust     | [`rust/`](rust/) (crate `enclave-vaults-client`) | `enclave_vaults_client::client`                                |
+| Rust     | [`rust/`](rust/) (crate `vault-client`)       | `vault_client::client`                                           |
 | Go tool  | [`go/cmd/vaultprobe/`](go/cmd/vaultprobe/)    | `vaultprobe`, a per-member read-only probe (see below)           |
 
 Both implementations expose two layers:
@@ -25,7 +25,7 @@ Both implementations cover the basic operations. Threshold keys, binding v2 appr
 
 ## Vault operations
 
-Each `Client` instance is a single RA-TLS session to one vault. The table names the Go methods; the Rust client has the snake_case equivalents of the basic operations.
+Each `Client` instance is a single RA-TLS session to one vault. The table names the Go methods; the Rust client has the snake_case equivalents of the basic operations. Binding v2 approvals (promoting a build, exporting, deleting or changing the rules of a key that asks for them) are in the Go client; the Rust client gains them next.
 
 | Operation | Purpose | Authenticator |
 | --- | --- | --- |
@@ -45,7 +45,6 @@ Each `Client` instance is a single RA-TLS session to one vault. The table names 
 | `GetPolicy` / `GetPolicyRaw` (Go) | The current policy + `policy_version` (raw: exactly as the vault serialised it) | Key principals |
 | `CanonicalisePolicy` / `CanonicalPolicy` (Go) | A policy's digest, and its stored form | None |
 | `GetVaultIdentity` (Go) | The vault's member id, billing id, MRENCLAVE, quote and capabilities; refused unless the connection pinned an MRENCLAVE | None |
-| `IssueApprovalToken` | A manager mints a short-lived approval token for a specific `(handle, op)` | Manager OIDC |
 | `ReadAuditLog` | Sealed append-only log; one entry per attempted op | Owner / auditor |
 
 Pending-profile lifecycle (used during enclave upgrades) lives on the same `Client`: `StagePendingProfile`, `ListPendingProfiles`, `PromotePendingProfile`, `RevokePendingProfile`, and the matching `Constellation` methods that fan them out across the vaults that hold the key.
@@ -103,7 +102,6 @@ func main() {
             Measurements:       []vault.Measurement{{Mrenclave: "a1b2…"}},
             AttestationServers: []vault.AttestationServer{{URL: "https://as.privasys.org/verify"}},
         },
-        vault.PlatformBuild,
     )
     for _, r := range results {
         fmt.Printf("%s: ok=%v err=%v pending_id=%d\n",
@@ -115,9 +113,9 @@ func main() {
 ## Rust quick start
 
 ```rust
-use enclave_vaults_client::client::{
+use vault_client::client::{
     AttestationProfile, AttestationServer, Client, Constellation, DialOptions, Measurement,
-    PendingProfileSource, StaticToken, VaultRegistration,
+    StaticToken, VaultRegistration,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -154,7 +152,6 @@ fn main() -> anyhow::Result<()> {
             }],
             required_oids: vec![],
         },
-        PendingProfileSource::PlatformBuild,
     )?;
     for r in &results {
         println!("{}: ok={}", r.vault.host(), r.result.is_ok());
@@ -172,7 +169,7 @@ The `RawShare` key type stores Shamir shares of an external secret (for example 
 - Per-byte independent random polynomial of degree `threshold − 1`
 - Threshold ≥ 2, ≤ 255 shares total
 
-Helpers: `vault.ShamirSplit(secret, threshold, n)` / `vault.ShamirReconstruct(shares)` (Go) and `enclave_vaults_client::shamir::{split, reconstruct}` (Rust). Tests: `cd go && go test ./vault/ -v` and `cd rust && cargo test`.
+Helpers: `vault.ShamirSplit(secret, threshold, n)` / `vault.ShamirReconstruct(shares)` (Go) and `vault_client::shamir::{split, reconstruct}` (Rust). Tests: `cd go && go test ./vault/ -v` and `cd rust && cargo test`.
 
 ## vaultprobe
 

@@ -194,13 +194,6 @@ pub enum PolicyField {
     PendingProfiles,
 }
 
-/// Origin of a pending attestation profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PendingProfileSource {
-    PlatformBuild,
-    ManualImport,
-}
-
 /// Outcome recorded in the audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuditDecision {
@@ -253,18 +246,10 @@ pub struct OidcPrincipal {
     pub required_roles: Vec<String>,
 }
 
-/// FIDO2 authentication (reserved — not yet honoured).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Fido2Principal {
-    pub rp_id: String,
-    pub credential_id_b64: String,
-}
-
 /// An identity that can act on a key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Principal {
     Oidc(OidcPrincipal),
-    Fido2(Fido2Principal),
     Tee(AttestationProfile),
 }
 
@@ -298,17 +283,6 @@ pub enum PrincipalRef {
 /// Extra access-time predicate attached to an [`OperationRule`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Condition {
-    AttestationMatches(AttestationProfile),
-    ManagerApproval {
-        manager: u32,
-        fresh_for_seconds: u64,
-    },
-    TimeWindow {
-        #[serde(default, skip_serializing_if = "is_zero_u64")]
-        not_before: u64,
-        #[serde(default, skip_serializing_if = "is_zero_u64")]
-        not_after: u64,
-    },
     /// The caller's OIDC bearer must prove a fresh step-up: its `amr` holds
     /// every method in `required_amr`, its `iat` is within
     /// `fresh_for_seconds`, and when `operation_bound` its `vault_op` binds
@@ -379,18 +353,11 @@ pub struct KeyPolicy {
     pub approval: Option<String>,
 }
 
-/// JWT minted by `IssueApprovalToken`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApprovalToken {
-    pub jwt: String,
-}
-
 /// Staged-but-not-promoted attestation profile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingProfile {
     pub id: u32,
     pub profile: AttestationProfile,
-    pub source: PendingProfileSource,
     pub staged_at: u64,
     pub staged_by_sub: String,
 }
@@ -449,16 +416,13 @@ enum VaultRequest<'a> {
     },
     ExportKey {
         handle: &'a str,
-        approvals: &'a [ApprovalToken],
     },
     DeleteKey {
         handle: &'a str,
-        approvals: &'a [ApprovalToken],
     },
     UpdatePolicy {
         handle: &'a str,
         new_policy: &'a KeyPolicy,
-        approvals: &'a [ApprovalToken],
     },
     GetPolicy {
         handle: &'a str,
@@ -474,7 +438,6 @@ enum VaultRequest<'a> {
         aad_b64: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         iv_b64: Option<String>,
-        approvals: &'a [ApprovalToken],
     },
     Unwrap {
         handle: &'a str,
@@ -482,22 +445,14 @@ enum VaultRequest<'a> {
         iv_b64: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         aad_b64: Option<String>,
-        approvals: &'a [ApprovalToken],
     },
     Sign {
         handle: &'a str,
         message_b64: String,
-        approvals: &'a [ApprovalToken],
     },
     Mac {
         handle: &'a str,
         message_b64: String,
-        approvals: &'a [ApprovalToken],
-    },
-    IssueApprovalToken {
-        handle: &'a str,
-        op: Operation,
-        ttl_seconds: u64,
     },
     ReadAuditLog {
         handle: &'a str,
@@ -507,7 +462,8 @@ enum VaultRequest<'a> {
     StagePendingProfile {
         handle: &'a str,
         profile: &'a AttestationProfile,
-        source: PendingProfileSource,
+        /// Fixed: older vaults require the field.
+        source: &'static str,
     },
     ListPendingProfiles {
         handle: &'a str,
@@ -515,7 +471,6 @@ enum VaultRequest<'a> {
     PromotePendingProfile {
         handle: &'a str,
         pending_id: u32,
-        approvals: &'a [ApprovalToken],
     },
     RevokePendingProfile {
         handle: &'a str,
@@ -561,7 +516,6 @@ enum VaultResponse {
         mac: Vec<u8>,
         alg: String,
     },
-    ApprovalTokenIssued(ApprovalToken),
     AuditLog {
         entries: Vec<AuditEntry>,
         next_seq: u64,
@@ -787,16 +741,16 @@ impl Client {
 
     /// Export raw key material (only when `exportable` and the policy
     /// grants `ExportKey` to the caller).
-    pub fn export_key(&self, handle: &str, approvals: &[ApprovalToken]) -> Result<Vec<u8>> {
-        match self.call(&VaultRequest::ExportKey { handle, approvals })? {
+    pub fn export_key(&self, handle: &str) -> Result<Vec<u8>> {
+        match self.call(&VaultRequest::ExportKey { handle })? {
             VaultResponse::KeyMaterial { material, .. } => Ok(material),
             _ => Err(Error::UnexpectedResponse),
         }
     }
 
     /// Delete a key and its policy.
-    pub fn delete_key(&self, handle: &str, approvals: &[ApprovalToken]) -> Result<()> {
-        match self.call(&VaultRequest::DeleteKey { handle, approvals })? {
+    pub fn delete_key(&self, handle: &str) -> Result<()> {
+        match self.call(&VaultRequest::DeleteKey { handle })? {
             VaultResponse::KeyDeleted => Ok(()),
             _ => Err(Error::UnexpectedResponse),
         }
@@ -804,17 +758,8 @@ impl Client {
 
     /// Replace the policy on an existing key. Returns the new
     /// `policy_version`.
-    pub fn update_policy(
-        &self,
-        handle: &str,
-        new_policy: &KeyPolicy,
-        approvals: &[ApprovalToken],
-    ) -> Result<u32> {
-        match self.call(&VaultRequest::UpdatePolicy {
-            handle,
-            new_policy,
-            approvals,
-        })? {
+    pub fn update_policy(&self, handle: &str, new_policy: &KeyPolicy) -> Result<u32> {
+        match self.call(&VaultRequest::UpdatePolicy { handle, new_policy })? {
             VaultResponse::PolicyUpdated { policy_version } => Ok(policy_version),
             _ => Err(Error::UnexpectedResponse),
         }
@@ -854,14 +799,12 @@ impl Client {
         plaintext: &[u8],
         aad: Option<&[u8]>,
         iv: Option<&[u8]>,
-        approvals: &[ApprovalToken],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let req = VaultRequest::Wrap {
             handle,
             plaintext_b64: URL_SAFE_NO_PAD.encode(plaintext),
             aad_b64: aad.map(|a| URL_SAFE_NO_PAD.encode(a)),
             iv_b64: iv.map(|i| URL_SAFE_NO_PAD.encode(i)),
-            approvals,
         };
         match self.call(&req)? {
             VaultResponse::Wrapped { ciphertext, iv } => Ok((ciphertext, iv)),
@@ -876,14 +819,12 @@ impl Client {
         ciphertext: &[u8],
         iv: &[u8],
         aad: Option<&[u8]>,
-        approvals: &[ApprovalToken],
     ) -> Result<Vec<u8>> {
         let req = VaultRequest::Unwrap {
             handle,
             ciphertext_b64: URL_SAFE_NO_PAD.encode(ciphertext),
             iv_b64: URL_SAFE_NO_PAD.encode(iv),
             aad_b64: aad.map(|a| URL_SAFE_NO_PAD.encode(a)),
-            approvals,
         };
         match self.call(&req)? {
             VaultResponse::Unwrapped { plaintext } => Ok(plaintext),
@@ -892,16 +833,10 @@ impl Client {
     }
 
     /// Produce an IEEE P1363 ECDSA-P256-SHA256 signature.
-    pub fn sign(
-        &self,
-        handle: &str,
-        message: &[u8],
-        approvals: &[ApprovalToken],
-    ) -> Result<(Vec<u8>, String)> {
+    pub fn sign(&self, handle: &str, message: &[u8]) -> Result<(Vec<u8>, String)> {
         match self.call(&VaultRequest::Sign {
             handle,
             message_b64: URL_SAFE_NO_PAD.encode(message),
-            approvals,
         })? {
             VaultResponse::Signature { signature, alg } => Ok((signature, alg)),
             _ => Err(Error::UnexpectedResponse),
@@ -909,36 +844,12 @@ impl Client {
     }
 
     /// Produce an HMAC-SHA-256 tag.
-    pub fn mac(
-        &self,
-        handle: &str,
-        message: &[u8],
-        approvals: &[ApprovalToken],
-    ) -> Result<(Vec<u8>, String)> {
+    pub fn mac(&self, handle: &str, message: &[u8]) -> Result<(Vec<u8>, String)> {
         match self.call(&VaultRequest::Mac {
             handle,
             message_b64: URL_SAFE_NO_PAD.encode(message),
-            approvals,
         })? {
             VaultResponse::MacTag { mac, alg } => Ok((mac, alg)),
-            _ => Err(Error::UnexpectedResponse),
-        }
-    }
-
-    /// Mint an approval token for an operation. Caller must be a manager
-    /// in the policy. `ttl_seconds = 0` → vault default.
-    pub fn issue_approval_token(
-        &self,
-        handle: &str,
-        op: Operation,
-        ttl_seconds: u64,
-    ) -> Result<ApprovalToken> {
-        match self.call(&VaultRequest::IssueApprovalToken {
-            handle,
-            op,
-            ttl_seconds,
-        })? {
-            VaultResponse::ApprovalTokenIssued(t) => Ok(t),
             _ => Err(Error::UnexpectedResponse),
         }
     }
@@ -962,16 +873,11 @@ impl Client {
 
     /// Stage an attestation profile on this vault. Returns the
     /// `pending_id` (vault-local).
-    pub fn stage_pending_profile(
-        &self,
-        handle: &str,
-        profile: &AttestationProfile,
-        source: PendingProfileSource,
-    ) -> Result<u32> {
+    pub fn stage_pending_profile(&self, handle: &str, profile: &AttestationProfile) -> Result<u32> {
         match self.call(&VaultRequest::StagePendingProfile {
             handle,
             profile,
-            source,
+            source: "PlatformBuild",
         })? {
             VaultResponse::PendingProfileStaged { pending_id } => Ok(pending_id),
             _ => Err(Error::UnexpectedResponse),
@@ -988,17 +894,8 @@ impl Client {
 
     /// Promote a pending profile into `principals.tees`. Returns the new
     /// `policy_version`.
-    pub fn promote_pending_profile(
-        &self,
-        handle: &str,
-        pending_id: u32,
-        approvals: &[ApprovalToken],
-    ) -> Result<u32> {
-        match self.call(&VaultRequest::PromotePendingProfile {
-            handle,
-            pending_id,
-            approvals,
-        })? {
+    pub fn promote_pending_profile(&self, handle: &str, pending_id: u32) -> Result<u32> {
+        match self.call(&VaultRequest::PromotePendingProfile { handle, pending_id })? {
             VaultResponse::PendingProfilePromoted { policy_version } => Ok(policy_version),
             _ => Err(Error::UnexpectedResponse),
         }
@@ -1169,10 +1066,9 @@ impl Constellation {
         &self,
         handle: &str,
         profile: &AttestationProfile,
-        source: PendingProfileSource,
     ) -> Result<Vec<EndpointResult>> {
         self.for_each(|c| {
-            c.stage_pending_profile(handle, profile, source)
+            c.stage_pending_profile(handle, profile)
                 .map(EndpointPayload::PendingId)
         })
     }
@@ -1185,15 +1081,14 @@ impl Constellation {
         })
     }
 
-    /// Promote `pending_id` on every live vault, carrying `approvals`.
+    /// Promote `pending_id` on every live vault.
     pub fn promote_pending_profile(
         &self,
         handle: &str,
         pending_id: u32,
-        approvals: &[ApprovalToken],
     ) -> Result<Vec<EndpointResult>> {
         self.for_each(|c| {
-            c.promote_pending_profile(handle, pending_id, approvals)
+            c.promote_pending_profile(handle, pending_id)
                 .map(EndpointPayload::PolicyVersion)
         })
     }
@@ -1267,19 +1162,15 @@ mod tests {
             "lifecycle":{"ttl_seconds":7776000},"approval":"none"}"#;
         let p: KeyPolicy = serde_json::from_str(raw).unwrap();
         assert_eq!(p.approval.as_deref(), Some("none"));
-        match &p.operations[0].requires[0] {
-            Condition::OidcStepUp {
-                required_amr,
-                operation_bound,
-                fresh_for_seconds,
-                binding,
-            } => {
-                assert_eq!(required_amr, &["webauthn".to_string()]);
-                assert!(*operation_bound);
-                assert_eq!((*fresh_for_seconds, *binding), (300, 2));
-            }
-            c => panic!("unexpected condition {c:?}"),
-        }
+        let Condition::OidcStepUp {
+            required_amr,
+            operation_bound,
+            fresh_for_seconds,
+            binding,
+        } = &p.operations[0].requires[0];
+        assert_eq!(required_amr, &["webauthn".to_string()]);
+        assert!(*operation_bound);
+        assert_eq!((*fresh_for_seconds, *binding), (300, 2));
         let back = serde_json::to_value(&p).unwrap();
         assert_eq!(back["approval"], "none");
         assert_eq!(
@@ -1295,20 +1186,16 @@ mod tests {
             "operations":[{"ops":["ExportKey"],"principals":["Owner"],"requires":[{"OidcStepUp":{"required_amr":["webauthn"]}}]}]}"#;
         let p: KeyPolicy = serde_json::from_str(raw).unwrap();
         assert!(p.approval.is_none());
-        match &p.operations[0].requires[0] {
-            Condition::OidcStepUp {
-                operation_bound,
-                fresh_for_seconds,
-                binding,
-                ..
-            } => {
-                assert_eq!(
-                    (*operation_bound, *fresh_for_seconds, *binding),
-                    (false, 0, 0)
-                );
-            }
-            c => panic!("unexpected condition {c:?}"),
-        }
+        let Condition::OidcStepUp {
+            operation_bound,
+            fresh_for_seconds,
+            binding,
+            ..
+        } = &p.operations[0].requires[0];
+        assert_eq!(
+            (*operation_bound, *fresh_for_seconds, *binding),
+            (false, 0, 0)
+        );
         let back = serde_json::to_string(&p).unwrap();
         assert!(!back.contains("approval") && !back.contains("binding"));
     }

@@ -257,7 +257,7 @@ func TestUpdatePolicyRawSendsThePolicyAsGiven(t *testing.T) {
 	// receive exactly these, so its digest is the one the owner approved.
 	policy := json.RawMessage(`{"operations": [], "lifecycle": {"ttl_seconds": 0}}`)
 	c := &Client{opts: DialOptions{BindingMembers: []string{memberA}}}
-	raw, err := c.updatePolicyRawPayload("h", policy, nil)
+	raw, err := c.updatePolicyRawPayload("h", policy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +284,7 @@ func TestUpdatePolicyRawSendsThePolicyAsGiven(t *testing.T) {
 
 func TestDeleteKeyAfterNamesItsSuccessor(t *testing.T) {
 	c := &Client{opts: DialOptions{BindingMembers: []string{memberA}}}
-	raw, err := c.deleteKeyAfterPayload("apps/x/v1", "apps/x/v2", "-", nil)
+	raw, err := c.deleteKeyAfterPayload("apps/x/v1", "apps/x/v2", "-")
 	if err != nil {
 		t.Fatal(err)
 	}

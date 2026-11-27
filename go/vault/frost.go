@@ -69,10 +69,9 @@ type frostSessionReq struct {
 }
 
 type frostSignRound1Req struct {
-	Session    string          `json:"session"`
-	Handle     string          `json:"handle"`
-	MessageB64 string          `json:"message_b64"`
-	Approvals  []ApprovalToken `json:"approvals,omitempty"`
+	Session    string `json:"session"`
+	Handle     string `json:"handle"`
+	MessageB64 string `json:"message_b64"`
 }
 
 type frostSignRound2Req struct {
@@ -195,12 +194,11 @@ func (c *Client) FrostDkgAbort(ctx context.Context, session string) error {
 }
 
 // FrostSignRound1 asks the vault to take part in a signature: authorised
-// like Sign (the key's policy, this client's credentials, approvals).
+// like Sign (the key's policy, this client's credentials).
 // Returns the vault's participant index and its commitment.
-func (c *Client) FrostSignRound1(ctx context.Context, session, handle string, message []byte,
-	approvals ...ApprovalToken) (index uint16, commitment []byte, err error) {
+func (c *Client) FrostSignRound1(ctx context.Context, session, handle string, message []byte) (index uint16, commitment []byte, err error) {
 	resp, err := c.call(ctx, vaultRequest{FrostSignRound1: &frostSignRound1Req{
-		Session: session, Handle: handle, MessageB64: b64(message), Approvals: approvals,
+		Session: session, Handle: handle, MessageB64: b64(message),
 	}})
 	if err != nil {
 		return 0, nil, err
@@ -413,7 +411,7 @@ func (con *Constellation) CreateThresholdKey(ctx context.Context, handle, grant 
 // key's threshold up to its participants, and each vault enforces that).
 // Returns the 64-byte Ed25519 signature and its algorithm ("EdDSA").
 func (con *Constellation) SignThreshold(ctx context.Context, handle string, message []byte,
-	threshold int, approvals ...ApprovalToken) ([]byte, string, error) {
+	threshold int) ([]byte, string, error) {
 	vaults, err := con.listVaults(ctx)
 	if err != nil {
 		return nil, "", err
@@ -439,7 +437,7 @@ func (con *Constellation) SignThreshold(ctx context.Context, handle string, mess
 			failures = append(failures, fmt.Sprintf("%s: %v", v.Endpoint, err))
 			continue
 		}
-		idx, commitment, err := c.FrostSignRound1(ctx, session, handle, message, approvals...)
+		idx, commitment, err := c.FrostSignRound1(ctx, session, handle, message)
 		if err != nil {
 			c.Close()
 			failures = append(failures, fmt.Sprintf("%s: %v", v.Endpoint, err))

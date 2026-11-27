@@ -75,7 +75,6 @@ type Renewal struct {
 	Predecessor     string
 	Policy          json.RawMessage
 	PolicyVersion   uint32
-	HolderRecords   []json.RawMessage // holder records the carried policy names; vaults refuse any for now, so leave nil
 	SourceBillingID string
 	KeyCheck        *KeyCheck // fresh for a move, rotation or creation; nil in place
 	// With a carried Policy: the source key's exportable flag and type, as
@@ -93,17 +92,16 @@ type Renewal struct {
 const CapabilityGenerations = "generations-v1"
 
 type renewalCreateKeyReq struct {
-	Handle            string            `json:"handle"`
-	MaterialB64       string            `json:"material_b64"`
-	Grant             string            `json:"grant"`
-	Predecessor       string            `json:"predecessor,omitempty"`
-	Policy            json.RawMessage   `json:"policy,omitempty"`
-	PolicyVersion     uint32            `json:"policy_version,omitempty"`
-	HolderRecords     []json.RawMessage `json:"holder_records,omitempty"`
-	SourceBillingID   string            `json:"source_billing_id,omitempty"`
-	KeyCheck          *KeyCheck         `json:"key_check,omitempty"`
-	CarriedExportable *bool             `json:"carried_exportable,omitempty"`
-	CarriedKeyType    KeyType           `json:"carried_key_type,omitempty"`
+	Handle            string          `json:"handle"`
+	MaterialB64       string          `json:"material_b64"`
+	Grant             string          `json:"grant"`
+	Predecessor       string          `json:"predecessor,omitempty"`
+	Policy            json.RawMessage `json:"policy,omitempty"`
+	PolicyVersion     uint32          `json:"policy_version,omitempty"`
+	SourceBillingID   string          `json:"source_billing_id,omitempty"`
+	KeyCheck          *KeyCheck       `json:"key_check,omitempty"`
+	CarriedExportable *bool           `json:"carried_exportable,omitempty"`
+	CarriedKeyType    KeyType         `json:"carried_key_type,omitempty"`
 }
 
 // CreateKeyRenewal creates the next generation of a key under handle, with
@@ -126,7 +124,6 @@ func (c *Client) CreateKeyRenewal(ctx context.Context, handle string, material [
 		Predecessor:       r.Predecessor,
 		Policy:            r.Policy,
 		PolicyVersion:     r.PolicyVersion,
-		HolderRecords:     r.HolderRecords,
 		SourceBillingID:   r.SourceBillingID,
 		KeyCheck:          r.KeyCheck,
 		CarriedExportable: r.CarriedExportable,

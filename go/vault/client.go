@@ -33,7 +33,7 @@ package vault
 //     attestation profiles for an enclave upgrade):
 //
 //         con := NewConstellation(reg, dialOpts)
-//         results, _ := con.StagePendingProfile(ctx, "my-key", profile, PlatformBuild)
+//         results, _ := con.StagePendingProfile(ctx, "my-key", profile)
 //
 // Shamir Secret Sharing helpers (shamir.go) split a secret into per-vault
 // shares; Constellation.CreateKeyShares uses them to create one key across
@@ -197,14 +197,6 @@ const (
 	FieldPendingProfiles PolicyField = "PendingProfiles"
 )
 
-// PendingProfileSource records who staged a pending attestation profile.
-type PendingProfileSource string
-
-const (
-	PlatformBuild PendingProfileSource = "PlatformBuild"
-	ManualImport  PendingProfileSource = "ManualImport"
-)
-
 // AuditDecision is the outcome of an audited operation.
 type AuditDecision string
 
@@ -220,9 +212,8 @@ const (
 // Principal is an identity that can act on a key. Exactly one variant
 // field must be non-nil at a time (matches Rust externally-tagged enum).
 type Principal struct {
-	Oidc  *OidcPrincipal      `json:"Oidc,omitempty"`
-	Fido2 *Fido2Principal     `json:"Fido2,omitempty"`
-	Tee   *AttestationProfile `json:"Tee,omitempty"`
+	Oidc *OidcPrincipal      `json:"Oidc,omitempty"`
+	Tee  *AttestationProfile `json:"Tee,omitempty"`
 }
 
 // OidcPrincipal authenticates via an OIDC bearer token whose `iss` matches
@@ -233,13 +224,6 @@ type OidcPrincipal struct {
 	Issuer        string   `json:"issuer"`
 	Sub           string   `json:"sub"`
 	RequiredRoles []string `json:"required_roles,omitempty"`
-}
-
-// Fido2Principal authenticates via a previously-registered FIDO2
-// credential. Reserved — not yet honoured by the vault.
-type Fido2Principal struct {
-	RpID            string `json:"rp_id"`
-	CredentialIDB64 string `json:"credential_id_b64"`
 }
 
 // AttestationProfile constrains what a remote TEE quote must satisfy.
@@ -378,15 +362,9 @@ func RefTee(i uint32) PrincipalRef     { return PrincipalRef{Tee: &i} }
 //
 // On the wire it serialises as one of:
 //
-//	{"AttestationMatches": <AttestationProfile>}
-//	{"ManagerApproval":    {"manager": u32, "fresh_for_seconds": u64}}
-//	{"TimeWindow":         {"not_before": u64, "not_after": u64}}
-//	{"OidcStepUp":         {"required_amr": [...], "operation_bound": bool, "fresh_for_seconds": u64}}
+//	{"OidcStepUp": {"required_amr": [...], "operation_bound": bool, "fresh_for_seconds": u64}}
 type Condition struct {
-	AttestationMatches *AttestationProfile  `json:"AttestationMatches,omitempty"`
-	ManagerApproval    *ManagerApprovalCond `json:"ManagerApproval,omitempty"`
-	TimeWindow         *TimeWindowCond      `json:"TimeWindow,omitempty"`
-	OidcStepUp         *OidcStepUpCond      `json:"OidcStepUp,omitempty"`
+	OidcStepUp *OidcStepUpCond `json:"OidcStepUp,omitempty"`
 }
 
 // OidcStepUpCond requires the caller's OIDC bearer to prove a fresh WebAuthn
@@ -404,18 +382,6 @@ type OidcStepUpCond struct {
 	// takes v1 only. See docs/vault.md in
 	// https://github.com/Privasys/enclave-os-mini.
 	Binding uint8 `json:"binding,omitempty"`
-}
-
-// ManagerApprovalCond requires a fresh approval token from a manager.
-type ManagerApprovalCond struct {
-	Manager         uint32 `json:"manager"`
-	FreshForSeconds uint64 `json:"fresh_for_seconds"`
-}
-
-// TimeWindowCond constrains the allowed wall-clock window. 0 = unbounded.
-type TimeWindowCond struct {
-	NotBefore uint64 `json:"not_before,omitempty"`
-	NotAfter  uint64 `json:"not_after,omitempty"`
 }
 
 // OperationRule grants a set of operations to a set of principals.
@@ -456,21 +422,15 @@ type KeyPolicy struct {
 	Approval string `json:"approval,omitempty"`
 }
 
-// ApprovalToken carries a JWT issued by IssueApprovalToken.
-type ApprovalToken struct {
-	JWT string `json:"jwt"`
-}
-
 // PendingProfile is a staged-but-not-promoted attestation profile.
 type PendingProfile struct {
-	ID          uint32               `json:"id"`
-	Profile     AttestationProfile   `json:"profile"`
-	Source      PendingProfileSource `json:"source"`
-	StagedAt    uint64               `json:"staged_at"`
-	StagedBySub string               `json:"staged_by_sub"`
+	ID          uint32             `json:"id"`
+	Profile     AttestationProfile `json:"profile"`
+	StagedAt    uint64             `json:"staged_at"`
+	StagedBySub string             `json:"staged_by_sub"`
 	// StagedByPlatform is set by the VAULT when the stager was the platform
 	// (manager-role bearer via the staging-only capability), never a key
-	// principal. Server-derived; the caller-supplied Source is advisory.
+	// principal. Server-derived.
 	StagedByPlatform bool `json:"staged_by_platform,omitempty"`
 }
 
@@ -539,7 +499,6 @@ type vaultRequest struct {
 	Unwrap                *unwrapReq                `json:"Unwrap,omitempty"`
 	Sign                  *signOrMacReq             `json:"Sign,omitempty"`
 	Mac                   *signOrMacReq             `json:"Mac,omitempty"`
-	IssueApprovalToken    *issueApprovalTokenReq    `json:"IssueApprovalToken,omitempty"`
 	ReadAuditLog          *readAuditLogReq          `json:"ReadAuditLog,omitempty"`
 	StagePendingProfile   *stagePendingProfileReq   `json:"StagePendingProfile,omitempty"`
 	ListPendingProfiles   *handleReq                `json:"ListPendingProfiles,omitempty"`
@@ -596,15 +555,13 @@ type handleReq struct {
 }
 
 type handleApprovalsReq struct {
-	Handle    string          `json:"handle"`
-	Approvals []ApprovalToken `json:"approvals,omitempty"`
-	Binding   *bindingMembers `json:"binding,omitempty"`
+	Handle  string          `json:"handle"`
+	Binding *bindingMembers `json:"binding,omitempty"`
 }
 
 type updatePolicyReq struct {
 	Handle    string          `json:"handle"`
 	NewPolicy KeyPolicy       `json:"new_policy"`
-	Approvals []ApprovalToken `json:"approvals,omitempty"`
 	Binding   *bindingMembers `json:"binding,omitempty"`
 }
 
@@ -612,37 +569,27 @@ type updatePolicyReq struct {
 type updatePolicyRawReq struct {
 	Handle    string          `json:"handle"`
 	NewPolicy json.RawMessage `json:"new_policy"`
-	Approvals []ApprovalToken `json:"approvals,omitempty"`
 	Binding   *bindingMembers `json:"binding,omitempty"`
 }
 
 type wrapReq struct {
-	Handle       string          `json:"handle"`
-	PlaintextB64 string          `json:"plaintext_b64"`
-	AadB64       string          `json:"aad_b64,omitempty"`
-	IvB64        string          `json:"iv_b64,omitempty"`
-	Approvals    []ApprovalToken `json:"approvals,omitempty"`
+	Handle       string `json:"handle"`
+	PlaintextB64 string `json:"plaintext_b64"`
+	AadB64       string `json:"aad_b64,omitempty"`
+	IvB64        string `json:"iv_b64,omitempty"`
 }
 
 type unwrapReq struct {
-	Handle        string          `json:"handle"`
-	CiphertextB64 string          `json:"ciphertext_b64"`
-	IvB64         string          `json:"iv_b64"`
-	AadB64        string          `json:"aad_b64,omitempty"`
-	Approvals     []ApprovalToken `json:"approvals,omitempty"`
+	Handle        string `json:"handle"`
+	CiphertextB64 string `json:"ciphertext_b64"`
+	IvB64         string `json:"iv_b64"`
+	AadB64        string `json:"aad_b64,omitempty"`
 }
 
 type signOrMacReq struct {
-	Handle     string          `json:"handle"`
-	MessageB64 string          `json:"message_b64"`
-	Prehashed  bool            `json:"prehashed,omitempty"`
-	Approvals  []ApprovalToken `json:"approvals,omitempty"`
-}
-
-type issueApprovalTokenReq struct {
-	Handle     string    `json:"handle"`
-	Op         Operation `json:"op"`
-	TTLSeconds uint64    `json:"ttl_seconds,omitempty"`
+	Handle     string `json:"handle"`
+	MessageB64 string `json:"message_b64"`
+	Prehashed  bool   `json:"prehashed,omitempty"`
 }
 
 type readAuditLogReq struct {
@@ -652,15 +599,15 @@ type readAuditLogReq struct {
 }
 
 type stagePendingProfileReq struct {
-	Handle  string               `json:"handle"`
-	Profile AttestationProfile   `json:"profile"`
-	Source  PendingProfileSource `json:"source"`
+	Handle  string             `json:"handle"`
+	Profile AttestationProfile `json:"profile"`
+	// Source is fixed: older vaults require the field.
+	Source string `json:"source"`
 }
 
 type promotePendingProfileReq struct {
 	Handle    string          `json:"handle"`
 	PendingID uint32          `json:"pending_id"`
-	Approvals []ApprovalToken `json:"approvals,omitempty"`
 	Binding   *bindingMembers `json:"binding,omitempty"`
 }
 
@@ -713,8 +660,7 @@ type vaultResponse struct {
 		Mac []byte `json:"mac"`
 		Alg string `json:"alg"`
 	} `json:"MacTag,omitempty"`
-	ApprovalTokenIssued *ApprovalToken `json:"ApprovalTokenIssued,omitempty"`
-	AuditLog            *struct {
+	AuditLog *struct {
 		Entries []AuditEntry `json:"entries"`
 		NextSeq uint64       `json:"next_seq"`
 	} `json:"AuditLog,omitempty"`
@@ -960,9 +906,9 @@ func (c *Client) CreateKey(ctx context.Context, handle string,
 
 // ExportKey returns the raw key material (only allowed when exportable
 // and the policy grants ExportKey to the caller).
-func (c *Client) ExportKey(ctx context.Context, handle string, approvals ...ApprovalToken) ([]byte, error) {
+func (c *Client) ExportKey(ctx context.Context, handle string) ([]byte, error) {
 	resp, err := c.call(ctx, vaultRequest{ExportKey: &handleApprovalsReq{
-		Handle: handle, Approvals: approvals, Binding: c.bindingMembers(),
+		Handle: handle, Binding: c.bindingMembers(),
 	}})
 	if err != nil {
 		return nil, err
@@ -974,9 +920,9 @@ func (c *Client) ExportKey(ctx context.Context, handle string, approvals ...Appr
 }
 
 // DeleteKey removes a key and its policy.
-func (c *Client) DeleteKey(ctx context.Context, handle string, approvals ...ApprovalToken) error {
+func (c *Client) DeleteKey(ctx context.Context, handle string) error {
 	resp, err := c.call(ctx, vaultRequest{DeleteKey: &handleApprovalsReq{
-		Handle: handle, Approvals: approvals, Binding: c.bindingMembers(),
+		Handle: handle, Binding: c.bindingMembers(),
 	}})
 	if err != nil {
 		return err
@@ -988,10 +934,9 @@ func (c *Client) DeleteKey(ctx context.Context, handle string, approvals ...Appr
 }
 
 // UpdatePolicy replaces the policy on an existing key.
-func (c *Client) UpdatePolicy(ctx context.Context, handle string, newPolicy KeyPolicy,
-	approvals ...ApprovalToken) (uint32, error) {
+func (c *Client) UpdatePolicy(ctx context.Context, handle string, newPolicy KeyPolicy) (uint32, error) {
 	resp, err := c.call(ctx, vaultRequest{UpdatePolicy: &updatePolicyReq{
-		Handle: handle, NewPolicy: newPolicy, Approvals: approvals, Binding: c.bindingMembers(),
+		Handle: handle, NewPolicy: newPolicy, Binding: c.bindingMembers(),
 	}})
 	if err != nil {
 		return 0, err
@@ -1009,15 +954,14 @@ func (c *Client) UpdatePolicy(ctx context.Context, handle string, newPolicy KeyP
 // target, or "-" when it was created rather than promoted. The vault
 // recomputes the bound target from them and refuses a successor equal to the
 // key.
-func (c *Client) DeleteKeyAfter(ctx context.Context, handle, successor, successorTarget string,
-	approvals ...ApprovalToken) error {
+func (c *Client) DeleteKeyAfter(ctx context.Context, handle, successor, successorTarget string) error {
 	if successor == "" || successor == handle {
 		return errors.New("delete after: a successor other than the key is required")
 	}
 	if successorTarget == "" {
 		successorTarget = "-"
 	}
-	payload, err := c.deleteKeyAfterPayload(handle, successor, successorTarget, approvals)
+	payload, err := c.deleteKeyAfterPayload(handle, successor, successorTarget)
 	if err != nil {
 		return fmt.Errorf("marshal request: %w", err)
 	}
@@ -1036,13 +980,12 @@ type deleteAfter struct {
 	SuccessorTarget string `json:"successor_target"`
 }
 
-func (c *Client) deleteKeyAfterPayload(handle, successor, successorTarget string, approvals []ApprovalToken) ([]byte, error) {
+func (c *Client) deleteKeyAfterPayload(handle, successor, successorTarget string) ([]byte, error) {
 	return json.Marshal(map[string]any{"DeleteKey": struct {
-		Handle    string          `json:"handle"`
-		Approvals []ApprovalToken `json:"approvals,omitempty"`
-		Binding   *bindingMembers `json:"binding,omitempty"`
-		After     deleteAfter     `json:"after"`
-	}{handle, approvals, c.bindingMembers(), deleteAfter{successor, successorTarget}}})
+		Handle  string          `json:"handle"`
+		Binding *bindingMembers `json:"binding,omitempty"`
+		After   deleteAfter     `json:"after"`
+	}{handle, c.bindingMembers(), deleteAfter{successor, successorTarget}}})
 }
 
 // UpdatePolicyRaw replaces the policy on an existing key with newPolicy as
@@ -1050,12 +993,11 @@ func (c *Client) deleteKeyAfterPayload(handle, successor, successorTarget string
 // digest of the policy JSON the owner was shown (PD, binding v2), so the
 // request must carry that JSON, with exactly its fields. The bytes are
 // compacted on the wire, which the digest (over the JCS form) does not see.
-func (c *Client) UpdatePolicyRaw(ctx context.Context, handle string, newPolicy json.RawMessage,
-	approvals ...ApprovalToken) (uint32, error) {
+func (c *Client) UpdatePolicyRaw(ctx context.Context, handle string, newPolicy json.RawMessage) (uint32, error) {
 	if !json.Valid(newPolicy) {
 		return 0, errors.New("update policy: new policy is not valid JSON")
 	}
-	payload, err := c.updatePolicyRawPayload(handle, newPolicy, approvals)
+	payload, err := c.updatePolicyRawPayload(handle, newPolicy)
 	if err != nil {
 		return 0, fmt.Errorf("marshal request: %w", err)
 	}
@@ -1073,15 +1015,14 @@ func (c *Client) UpdatePolicyRaw(ctx context.Context, handle string, newPolicy j
 // approval also binds replacedPD, PD of the policy being replaced as
 // GetPolicyRaw returns it. The vault refuses it if its policy has another
 // digest. Needs DialOptions.BindingMembers.
-func (c *Client) UpdatePolicyRawFrom(ctx context.Context, handle string, newPolicy json.RawMessage, replacedPD string,
-	approvals ...ApprovalToken) (uint32, error) {
+func (c *Client) UpdatePolicyRawFrom(ctx context.Context, handle string, newPolicy json.RawMessage, replacedPD string) (uint32, error) {
 	if !json.Valid(newPolicy) {
 		return 0, errors.New("update policy: new policy is not valid JSON")
 	}
 	if !isLowerHex64(replacedPD) {
 		return 0, errors.New("update_policy_from: the replaced policy digest must be 64 lowercase hex digits")
 	}
-	payload, err := c.updatePolicyRawFromPayload(handle, newPolicy, replacedPD, approvals)
+	payload, err := c.updatePolicyRawFromPayload(handle, newPolicy, replacedPD)
 	if err != nil {
 		return 0, fmt.Errorf("marshal request: %w", err)
 	}
@@ -1095,14 +1036,14 @@ func (c *Client) UpdatePolicyRawFrom(ctx context.Context, handle string, newPoli
 	return resp.PolicyUpdated.PolicyVersion, nil
 }
 
-func (c *Client) updatePolicyRawPayload(handle string, newPolicy json.RawMessage, approvals []ApprovalToken) ([]byte, error) {
-	return c.updatePolicyRawFromPayload(handle, newPolicy, "", approvals)
+func (c *Client) updatePolicyRawPayload(handle string, newPolicy json.RawMessage) ([]byte, error) {
+	return c.updatePolicyRawFromPayload(handle, newPolicy, "")
 }
 
 // updatePolicyRawFromPayload is the UpdatePolicy request; a non-empty
 // replacedPD makes it an update_policy_from, which also binds the policy it
 // replaces.
-func (c *Client) updatePolicyRawFromPayload(handle string, newPolicy json.RawMessage, replacedPD string, approvals []ApprovalToken) ([]byte, error) {
+func (c *Client) updatePolicyRawFromPayload(handle string, newPolicy json.RawMessage, replacedPD string) ([]byte, error) {
 	b := c.bindingMembers()
 	if replacedPD != "" {
 		if b == nil {
@@ -1111,7 +1052,7 @@ func (c *Client) updatePolicyRawFromPayload(handle string, newPolicy json.RawMes
 		b.ReplacedPD = replacedPD
 	}
 	return json.Marshal(map[string]updatePolicyRawReq{"UpdatePolicy": {
-		Handle: handle, NewPolicy: newPolicy, Approvals: approvals, Binding: b,
+		Handle: handle, NewPolicy: newPolicy, Binding: b,
 	}})
 }
 
@@ -1155,12 +1096,10 @@ func (c *Client) ListKeys(ctx context.Context) ([]KeyListEntry, error) {
 }
 
 // Wrap encrypts plaintext under an Aes256GcmKey. Returns ciphertext, iv.
-func (c *Client) Wrap(ctx context.Context, handle string, plaintext, aad, iv []byte,
-	approvals ...ApprovalToken) ([]byte, []byte, error) {
+func (c *Client) Wrap(ctx context.Context, handle string, plaintext, aad, iv []byte) ([]byte, []byte, error) {
 	r := &wrapReq{
 		Handle:       handle,
 		PlaintextB64: base64.RawURLEncoding.EncodeToString(plaintext),
-		Approvals:    approvals,
 	}
 	if len(aad) > 0 {
 		r.AadB64 = base64.RawURLEncoding.EncodeToString(aad)
@@ -1179,13 +1118,11 @@ func (c *Client) Wrap(ctx context.Context, handle string, plaintext, aad, iv []b
 }
 
 // Unwrap decrypts ciphertext under an Aes256GcmKey.
-func (c *Client) Unwrap(ctx context.Context, handle string, ciphertext, iv, aad []byte,
-	approvals ...ApprovalToken) ([]byte, error) {
+func (c *Client) Unwrap(ctx context.Context, handle string, ciphertext, iv, aad []byte) ([]byte, error) {
 	r := &unwrapReq{
 		Handle:        handle,
 		CiphertextB64: base64.RawURLEncoding.EncodeToString(ciphertext),
 		IvB64:         base64.RawURLEncoding.EncodeToString(iv),
-		Approvals:     approvals,
 	}
 	if len(aad) > 0 {
 		r.AadB64 = base64.RawURLEncoding.EncodeToString(aad)
@@ -1201,12 +1138,10 @@ func (c *Client) Unwrap(ctx context.Context, handle string, ciphertext, iv, aad 
 }
 
 // Sign produces an IEEE P1363 ECDSA-P256-SHA256 signature.
-func (c *Client) Sign(ctx context.Context, handle string, message []byte,
-	approvals ...ApprovalToken) ([]byte, string, error) {
+func (c *Client) Sign(ctx context.Context, handle string, message []byte) ([]byte, string, error) {
 	resp, err := c.call(ctx, vaultRequest{Sign: &signOrMacReq{
 		Handle:     handle,
 		MessageB64: base64.RawURLEncoding.EncodeToString(message),
-		Approvals:  approvals,
 	}})
 	if err != nil {
 		return nil, "", err
@@ -1220,13 +1155,11 @@ func (c *Client) Sign(ctx context.Context, handle string, message []byte,
 // SignPrehash produces an IEEE P1363 ECDSA-P256 signature over a caller-supplied
 // 32-byte SHA-256 digest, signed raw (no re-hash) — what PKCS#11 CKM_ECDSA and TLS
 // stacks send. Same key/policy (Operation::Sign) as Sign.
-func (c *Client) SignPrehash(ctx context.Context, handle string, digest []byte,
-	approvals ...ApprovalToken) ([]byte, string, error) {
+func (c *Client) SignPrehash(ctx context.Context, handle string, digest []byte) ([]byte, string, error) {
 	resp, err := c.call(ctx, vaultRequest{Sign: &signOrMacReq{
 		Handle:     handle,
 		MessageB64: base64.RawURLEncoding.EncodeToString(digest),
 		Prehashed:  true,
-		Approvals:  approvals,
 	}})
 	if err != nil {
 		return nil, "", err
@@ -1238,12 +1171,10 @@ func (c *Client) SignPrehash(ctx context.Context, handle string, digest []byte,
 }
 
 // Mac produces an HMAC-SHA-256 tag.
-func (c *Client) Mac(ctx context.Context, handle string, message []byte,
-	approvals ...ApprovalToken) ([]byte, string, error) {
+func (c *Client) Mac(ctx context.Context, handle string, message []byte) ([]byte, string, error) {
 	resp, err := c.call(ctx, vaultRequest{Mac: &signOrMacReq{
 		Handle:     handle,
 		MessageB64: base64.RawURLEncoding.EncodeToString(message),
-		Approvals:  approvals,
 	}})
 	if err != nil {
 		return nil, "", err
@@ -1252,23 +1183,6 @@ func (c *Client) Mac(ctx context.Context, handle string, message []byte,
 		return nil, "", ErrUnexpectedResponse
 	}
 	return resp.MacTag.Mac, resp.MacTag.Alg, nil
-}
-
-// IssueApprovalToken asks the vault to mint an approval token for a
-// specific operation. Caller must be one of policy.principals.managers.
-// ttlSeconds = 0 â†’ vault default.
-func (c *Client) IssueApprovalToken(ctx context.Context, handle string, op Operation,
-	ttlSeconds uint64) (ApprovalToken, error) {
-	resp, err := c.call(ctx, vaultRequest{IssueApprovalToken: &issueApprovalTokenReq{
-		Handle: handle, Op: op, TTLSeconds: ttlSeconds,
-	}})
-	if err != nil {
-		return ApprovalToken{}, err
-	}
-	if resp.ApprovalTokenIssued == nil {
-		return ApprovalToken{}, ErrUnexpectedResponse
-	}
-	return *resp.ApprovalTokenIssued, nil
 }
 
 // ReadAuditLog fetches audit entries for a key with seq > sinceSeq.
@@ -1299,17 +1213,17 @@ type StageOutcome struct {
 
 // StagePendingProfile stages an attestation profile on this vault.
 func (c *Client) StagePendingProfile(ctx context.Context, handle string,
-	profile AttestationProfile, source PendingProfileSource) (uint32, error) {
-	out, err := c.StagePendingProfileOutcome(ctx, handle, profile, source)
+	profile AttestationProfile) (uint32, error) {
+	out, err := c.StagePendingProfileOutcome(ctx, handle, profile)
 	return out.PendingID, err
 }
 
 // StagePendingProfileOutcome stages an attestation profile and returns the
 // vault's full outcome, including whether it was auto-promoted.
 func (c *Client) StagePendingProfileOutcome(ctx context.Context, handle string,
-	profile AttestationProfile, source PendingProfileSource) (StageOutcome, error) {
+	profile AttestationProfile) (StageOutcome, error) {
 	resp, err := c.call(ctx, vaultRequest{StagePendingProfile: &stagePendingProfileReq{
-		Handle: handle, Profile: profile, Source: source,
+		Handle: handle, Profile: profile, Source: "PlatformBuild",
 	}})
 	if err != nil {
 		return StageOutcome{}, err
@@ -1340,9 +1254,9 @@ func (c *Client) ListPendingProfiles(ctx context.Context, handle string) ([]Pend
 // PromotePendingProfile promotes a pending profile into
 // policy.principals.tees on this vault.
 func (c *Client) PromotePendingProfile(ctx context.Context, handle string,
-	pendingID uint32, approvals ...ApprovalToken) (uint32, error) {
+	pendingID uint32) (uint32, error) {
 	resp, err := c.call(ctx, vaultRequest{PromotePendingProfile: &promotePendingProfileReq{
-		Handle: handle, PendingID: pendingID, Approvals: approvals, Binding: c.bindingMembers(),
+		Handle: handle, PendingID: pendingID, Binding: c.bindingMembers(),
 	}})
 	if err != nil {
 		return 0, err
@@ -1476,9 +1390,9 @@ func (con *Constellation) forEach(ctx context.Context,
 
 // StagePendingProfile fans StagePendingProfile out to every live vault.
 func (con *Constellation) StagePendingProfile(ctx context.Context, handle string,
-	profile AttestationProfile, source PendingProfileSource) ([]EndpointResult, error) {
+	profile AttestationProfile) ([]EndpointResult, error) {
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
-		out, err := c.StagePendingProfileOutcome(ctx, handle, profile, source)
+		out, err := c.StagePendingProfileOutcome(ctx, handle, profile)
 		return EndpointResult{
 			PendingID:     out.PendingID,
 			AutoPromoted:  out.AutoPromoted,
@@ -1496,12 +1410,11 @@ func (con *Constellation) ListPendingProfiles(ctx context.Context, handle string
 	})
 }
 
-// PromotePendingProfile fans PromotePendingProfile out, carrying the
-// supplied approval tokens to each vault.
+// PromotePendingProfile fans PromotePendingProfile out to every live vault.
 func (con *Constellation) PromotePendingProfile(ctx context.Context, handle string,
-	pendingID uint32, approvals ...ApprovalToken) ([]EndpointResult, error) {
+	pendingID uint32) ([]EndpointResult, error) {
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
-		v, err := c.PromotePendingProfile(ctx, handle, pendingID, approvals...)
+		v, err := c.PromotePendingProfile(ctx, handle, pendingID)
 		return EndpointResult{PolicyVersion: v}, err
 	})
 }
@@ -1514,15 +1427,13 @@ func (con *Constellation) RevokePendingProfile(ctx context.Context, handle strin
 	})
 }
 
-// DeleteKey fans DeleteKey out to every live vault, carrying any approval
-// tokens to each. Used to retire a superseded key generation (e.g. the old
+// DeleteKey fans DeleteKey out to every live vault. Used to retire a superseded key generation (e.g. the old
 // gen-<n> after a KEK rotation has re-keyed the volume to gen-<n+1>).
 // Partial failures are surfaced verbatim; re-driving is idempotent (a vault
 // that no longer holds the handle simply reports it gone).
-func (con *Constellation) DeleteKey(ctx context.Context, handle string,
-	approvals ...ApprovalToken) ([]EndpointResult, error) {
+func (con *Constellation) DeleteKey(ctx context.Context, handle string) ([]EndpointResult, error) {
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
-		return EndpointResult{}, c.DeleteKey(ctx, handle, approvals...)
+		return EndpointResult{}, c.DeleteKey(ctx, handle)
 	})
 }
 
@@ -1539,13 +1450,12 @@ func (con *Constellation) GetPolicy(ctx context.Context, handle string) ([]Endpo
 	})
 }
 
-// UpdatePolicy fans a policy replacement out to every live vault, carrying any
-// approval tokens to each. The policy is replicated, so it must land on all
+// UpdatePolicy fans a policy replacement out to every live vault. The policy is replicated, so it must land on all
 // vaults; partial failures are surfaced verbatim per vault.
 func (con *Constellation) UpdatePolicy(ctx context.Context, handle string,
-	newPolicy KeyPolicy, approvals ...ApprovalToken) ([]EndpointResult, error) {
+	newPolicy KeyPolicy) ([]EndpointResult, error) {
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
-		ver, err := c.UpdatePolicy(ctx, handle, newPolicy, approvals...)
+		ver, err := c.UpdatePolicy(ctx, handle, newPolicy)
 		return EndpointResult{PolicyVersion: ver}, err
 	})
 }
@@ -1553,9 +1463,9 @@ func (con *Constellation) UpdatePolicy(ctx context.Context, handle string,
 // UpdatePolicyRaw fans a raw policy replacement out to every live vault (see
 // Client.UpdatePolicyRaw).
 func (con *Constellation) UpdatePolicyRaw(ctx context.Context, handle string,
-	newPolicy json.RawMessage, approvals ...ApprovalToken) ([]EndpointResult, error) {
+	newPolicy json.RawMessage) ([]EndpointResult, error) {
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
-		ver, err := c.UpdatePolicyRaw(ctx, handle, newPolicy, approvals...)
+		ver, err := c.UpdatePolicyRaw(ctx, handle, newPolicy)
 		return EndpointResult{PolicyVersion: ver}, err
 	})
 }
@@ -1563,9 +1473,9 @@ func (con *Constellation) UpdatePolicyRaw(ctx context.Context, handle string,
 // UpdatePolicyRawFrom sends an update_policy_from to every vault (see
 // Client.UpdatePolicyRawFrom).
 func (con *Constellation) UpdatePolicyRawFrom(ctx context.Context, handle string, newPolicy json.RawMessage,
-	replacedPD string, approvals ...ApprovalToken) ([]EndpointResult, error) {
+	replacedPD string) ([]EndpointResult, error) {
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
-		ver, err := c.UpdatePolicyRawFrom(ctx, handle, newPolicy, replacedPD, approvals...)
+		ver, err := c.UpdatePolicyRawFrom(ctx, handle, newPolicy, replacedPD)
 		return EndpointResult{PolicyVersion: ver}, err
 	})
 }
@@ -1589,10 +1499,9 @@ func (con *Constellation) CanonicalisePolicy(ctx context.Context, policy json.Ra
 }
 
 // DeleteKeyAfter fans DeleteKeyAfter out to every live vault.
-func (con *Constellation) DeleteKeyAfter(ctx context.Context, handle, successor, successorTarget string,
-	approvals ...ApprovalToken) ([]EndpointResult, error) {
+func (con *Constellation) DeleteKeyAfter(ctx context.Context, handle, successor, successorTarget string) ([]EndpointResult, error) {
 	return con.forEach(ctx, func(c *Client) (EndpointResult, error) {
-		return EndpointResult{}, c.DeleteKeyAfter(ctx, handle, successor, successorTarget, approvals...)
+		return EndpointResult{}, c.DeleteKeyAfter(ctx, handle, successor, successorTarget)
 	})
 }
 
@@ -1643,7 +1552,7 @@ func (con *Constellation) CreateKeyShares(ctx context.Context, handle string,
 // vault's RawShare material, and reconstructs the original secret once at
 // least `threshold` shares have been retrieved. The whole secret is
 // reassembled only in the caller's memory — no vault ever holds more than its
-// own share. The Dial OIDC bearer (and any `approvals`) must satisfy the key's
+// own share. The Dial OIDC bearer must satisfy the key's
 // ExportKey policy on every vault (e.g. owner + a fresh WebAuthn step-up).
 //
 // Returns the reconstructed secret plus the per-vault results (Success marks
@@ -1651,12 +1560,12 @@ func (con *Constellation) CreateKeyShares(ctx context.Context, handle string,
 // vaults returned a usable share; partial vault failures are surfaced in the
 // results so the caller can report which vaults were unreachable.
 func (con *Constellation) ExportKeyShares(ctx context.Context, handle string,
-	threshold int, approvals ...ApprovalToken) ([]byte, []EndpointResult, error) {
+	threshold int) ([]byte, []EndpointResult, error) {
 	if threshold < 2 {
 		return nil, nil, errors.New("threshold must be >= 2")
 	}
 	results, err := con.forEach(ctx, func(c *Client) (EndpointResult, error) {
-		material, err := c.ExportKey(ctx, handle, approvals...)
+		material, err := c.ExportKey(ctx, handle)
 		return EndpointResult{Material: material}, err
 	})
 	if err != nil {
@@ -1692,7 +1601,7 @@ func (con *Constellation) ExportKeyShares(ctx context.Context, handle string,
 // same-generation group that meets threshold (mirrors the manager's decodeShare
 // + bestGroup). Returns the reconstructed secret (the DEK).
 func (con *Constellation) ExportKeyGenerationShares(ctx context.Context, handle string,
-	threshold, genSize int, approvals ...ApprovalToken) ([]byte, []EndpointResult, error) {
+	threshold, genSize int) ([]byte, []EndpointResult, error) {
 	if threshold < 2 {
 		return nil, nil, errors.New("threshold must be >= 2")
 	}
@@ -1700,7 +1609,7 @@ func (con *Constellation) ExportKeyGenerationShares(ctx context.Context, handle 
 		return nil, nil, errors.New("genSize must be >= 1")
 	}
 	results, err := con.forEach(ctx, func(c *Client) (EndpointResult, error) {
-		material, err := c.ExportKey(ctx, handle, approvals...)
+		material, err := c.ExportKey(ctx, handle)
 		return EndpointResult{Material: material}, err
 	})
 	if err != nil {
